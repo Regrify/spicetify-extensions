@@ -11,6 +11,31 @@ async function waitForTrackData() {
     }
 }
 
+function spotifyHex(spotifyId) {
+    const INVALID = "00000000000000000000000000000000";
+    if (typeof spotifyId !== "string") {
+        return INVALID;
+    }
+    if (spotifyId.length === 0 || spotifyId.length > 22) {
+        return INVALID;
+    }
+    const characters =
+        "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let decimalValue = BigInt(0);
+    for (let i = 0; i < spotifyId.length; i++) {
+        const index = characters.indexOf(spotifyId[i]);
+        if (index === -1) {
+            return INVALID;
+        }
+        decimalValue = decimalValue * BigInt(62) + BigInt(index);
+    }
+    const hexValue = decimalValue.toString(16).padStart(32, "0");
+    if (hexValue.length > 32) {
+        return INVALID;
+    }
+    return hexValue;
+}
+
 window.operatingSystem = window.operatingSystem || null;
 (async function () {
     await waitForTrackData();
@@ -159,13 +184,31 @@ async function releaseDateCSS() {
 
 async function getTrackDetailsRD() {
     await waitForTrackData();
-    let trackId = await Spicetify.Player.data.item.uri.split(":")[2];
-    let trackDetails = await Spicetify.CosmosAsync.get(`https://api.spotify.com/v1/tracks/${trackId}`);
+    let trackId = Spicetify.Player.data.item.uri.split(":")[2];
+    const hexId = spotifyHex(trackId);
+    const trackDetails = await Spicetify.CosmosAsync.get(`https://spclient.wg.spotify.com/metadata/4/track/${hexId}?market=from_token`);
+    console.log('New API response:', trackDetails);
 
-    let album = trackDetails.album;
-    let releaseDate = new Date(trackDetails.album.release_date);
+    let album = {
+        name: trackDetails.album.name,
+        artists: trackDetails.album.artist.map(artist => ({ name: artist.name })),
+        album_type: 'album',
+        gid: trackDetails.album.gid,
+        external_urls: {
+            spotify: `spotify:album:${trackDetails.album.gid}`
+        },
+        images: trackDetails.album.cover_group.image.map(img => ({
+            url: `https://i.scdn.co/image/${img.file_id}`,
+            width: img.width,
+            height: img.height
+        }))
+    };
+
+    const dateObj = trackDetails.album.date;
+    const releaseDate = new Date(dateObj.year, dateObj.month - 1, dateObj.day || 1);
+    album.release_date = `${dateObj.year}-${String(dateObj.month).padStart(2, '0')}-${String(dateObj.day || 1).padStart(2, '0')}`;
+
     let operatingSystem = await Spicetify.Platform.operatingSystem;
-
     return { trackDetails, album, releaseDate, operatingSystem };
 }
 
@@ -199,7 +242,7 @@ async function initializeRD() {
         }
 
         document.head.appendChild(await releaseDateCSS());
-        
+
         createSettingsMenu();
     } catch (error) {
         console.error('Error initializing: ', error, "\nCreate a new issue on the github repo to get this resolved");
@@ -242,7 +285,7 @@ async function displayReleaseDate() {
             console.log('Creating genres container...');
             const trackInfoContainer = document.querySelector(".main-nowPlayingWidget-trackInfo .main-trackInfo-container");
             console.log('Track info container found:', !!trackInfoContainer);
-            
+
             if (trackInfoContainer) {
                 const genresPlaceholder = document.createElement("div");
                 genresPlaceholder.className = "main-trackInfo-genres";
@@ -363,10 +406,11 @@ function createSettingsMenu() {
         albumLinkElement.href = album.external_urls.spotify;
 
         const albumImageElement = document.createElement('img');
-        albumImageElement.src = album.images[2].url;
-        albumImageElement.width = album.images[2].width / 3 * 2;
-        albumImageElement.height = album.images[2].height / 3 * 2;
+        albumImageElement.src = album.images[1].url;
+        albumImageElement.width = 64;
+        albumImageElement.height = 64;
         albumImageElement.style.marginRight = '1rem';
+        albumImageElement.style.objectFit = 'cover';
 
         const albumNameElement = document.createElement('p');
         albumNameElement.textContent = `${album.name} - ${album.artists[0].name} \n`;
