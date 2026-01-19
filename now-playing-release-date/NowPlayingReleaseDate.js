@@ -1,6 +1,7 @@
 // NowPlayingReleaseDate — single pasteable script
-// Paste the entire contents of this file into the Spotify/Spicetify console and it will run immediately.
-// Toggle debug by setting localStorage.setItem('nprd-debug', 'true') before pasting, or toggle in the settings UI.
+// Paste the entire contents of this file into the Spotify/Spicetify console OR save to the extension file and run `spicetify apply`.
+// Debug: toggle with localStorage.setItem('nprd-debug','true') before pasting, or call window.__NowPlayingReleaseDate.toggleDebug(true).
+
 (function () {
     console.log('[Now Playing Release Date] loaded (single-paste)');
 
@@ -104,7 +105,7 @@
             #releaseDate span, #releaseDate a { display:inline-block; color:var(--text-subdued); cursor:pointer; }
             .main-nowPlayingWidget-nowPlaying .main-trackInfo-artists,
             .main-nowPlayingWidget-nowPlaying .main-trackInfo-name { display:flex; align-items:center; gap:6px; white-space:nowrap; }
-            #settingsMenu { display:none; position:absolute; background:var(--spice-main); padding:12px; border-radius:8px; box-shadow:0 6px 18px rgba(0,0,0,.3); min-width:220px; z-index:9999; }
+            #settingsMenu { display:none; position:absolute; background:var(--spice-main); padding:12px; border-radius:8px; box-shadow:0 6px 18px rgba(0,0,0,.3); min-width:220px; }
             #settingsMenu h2 { margin:0 0 8px 0; padding-bottom:6px; border-bottom:1px solid var(--spice-subtext); color:var(--spice-text); }
             .Dropdown-container { display:flex; justify-content:space-between; gap:10px; margin-top:6px; align-items:center; }
             .releaseDateDropdown-control { background:var(--spice-main); color:var(--spice-text); border:1px solid var(--spice-subtext); padding:4px; max-width:10rem; }
@@ -144,7 +145,7 @@
 
                 if (albumFromItem) {
                     const artists = albumFromItem.artists || albumFromItem.artist || item.artists || item.artist || [];
-                    const imagesRaw = albumFromItem.images?.length ? albumFromItem.images : (albumFromItem.cover_group?.image || []);
+                    const imagesRaw = (albumFromItem.images && albumFromItem.images.length) ? albumFromItem.images : (albumFromItem.cover_group?.image || []);
                     album = {
                         name: albumFromItem.name || albumFromItem.title || '',
                         artists: Array.isArray(artists) ? artists.map(a => ({ name: a.name || a })) : [{ name: artists.name || artists }],
@@ -213,7 +214,7 @@
                 album_type: item.album.album_type || 'album',
                 gid: item.album.gid || '',
                 external_urls: { spotify: item.album.external_urls?.spotify || '' },
-                images: (item.album.images || []).map(img => ({ url: img.url || (img.file_id ? `https://i.scdn.co/image/${img.file_id}` : img), width: img.width, height: img.height }))
+                images: (item.album.images || []).map(img => ({ url: img.url || (img.file_id ? `https://i.scdn.co/image/${img.file_id}` : ''), width: img.width, height: img.height }))
             };
         }
 
@@ -246,6 +247,7 @@
         return { el: null, usedSelector: null };
     }
 
+    let domObserver = null;
     function observeForContainer(targetSelector, onFound, timeout = 8000) {
         const immediate = findContainer(targetSelector);
         if (immediate.el) {
@@ -253,19 +255,19 @@
             onFound(immediate.el, immediate.usedSelector);
             return () => {};
         }
-        if (state.domObserver) state.domObserver.disconnect();
-        state.domObserver = new MutationObserver(() => {
+
+        if (domObserver) domObserver.disconnect();
+        domObserver = new MutationObserver(() => {
             const found = findContainer(targetSelector);
             if (found.el) {
                 log('found container via MutationObserver using', found.usedSelector);
-                state.domObserver.disconnect();
-                state.domObserver = null;
+                domObserver.disconnect();
+                domObserver = null;
                 onFound(found.el, found.usedSelector);
             }
         });
-        state.domObserver.observe(document.body, { childList: true, subtree: true });
-        // stop after timeout
-        const stop = () => { if (state.domObserver) { state.domObserver.disconnect(); state.domObserver = null; } };
+        domObserver.observe(document.body, { childList: true, subtree: true });
+        const stop = () => { if (domObserver) { domObserver.disconnect(); domObserver = null; } };
         setTimeout(stop, timeout);
         return stop;
     }
@@ -306,16 +308,16 @@
         releaseDateElement.style.gap = '6px';
 
         if (separatorVal && separatorVal.trim() !== "") {
-            const sep = document.createElement('span');
-            sep.textContent = separatorVal;
-            sep.style.display = 'inline-block';
-            sep.style.lineHeight = '1';
-            sep.style.color = 'var(--text-subdued)';
-            releaseDateElement.appendChild(sep);
+            const separatorElement = document.createElement("span");
+            separatorElement.textContent = separatorVal;
+            separatorElement.style.display = 'inline-block';
+            separatorElement.style.lineHeight = '1';
+            separatorElement.style.color = 'var(--text-subdued)';
+            releaseDateElement.appendChild(separatorElement);
         }
 
-        const dateEl = createAnchorElement(formattedReleaseDate);
-        releaseDateElement.appendChild(dateEl);
+        const dateElement = createAnchorElement(formattedReleaseDate);
+        releaseDateElement.appendChild(dateElement);
 
         const targetedElement = document.querySelector((localStorage.getItem('position') || '') + ' a');
         if (targetedElement) {
@@ -323,13 +325,12 @@
             setElementStyles(releaseDateElement, targetedStyles);
         }
 
-        // create settings menu if not present (we append outside this function)
         let settingsMenu = document.getElementById('settingsMenu');
         if (!settingsMenu) createSettingsMenu();
 
-        dateEl.addEventListener('click', function (e) {
-            e.preventDefault();
-            toggleSettingsMenu(dateEl, document.getElementById('settingsMenu'));
+        dateElement.addEventListener('click', function (event) {
+            event.preventDefault();
+            toggleSettingsMenu(dateElement, document.getElementById('settingsMenu'));
         });
 
         return releaseDateElement;
@@ -341,8 +342,8 @@
             const formatted = formatDateForDisplay(releaseDate, releaseDateString);
 
             removeExistingReleaseDateElement();
-            const userSelector = localStorage.getItem('position');
 
+            const userSelector = localStorage.getItem('position');
             log('trying to insert using user selector:', userSelector);
 
             const stop = observeForContainer(userSelector, (container, usedSelector) => {
@@ -355,25 +356,29 @@
                 }
             }, 8000);
 
-            // ensure observer removed after time (already handled), stop function returned if needed
             setTimeout(() => { try { stop(); } catch (e) {} }, 8500);
-        } catch (e) {
-            console.error('[NPRD] Error displaying release date:', e);
+        } catch (error) {
+            console.error('[NPRD] Error displaying release date:', error);
         }
     }
 
     function removeExistingReleaseDateElement() {
-        const el = document.getElementById('releaseDate');
-        if (el) el.remove();
-        const existingGenres = document.querySelector('.main-trackInfo-genres');
-        if (existingGenres) existingGenres.remove();
-        const menu = document.getElementById('settingsMenu');
-        if (menu) menu.style.display = 'none';
+        removeElementById('releaseDate');
+        const existingGenresElement = document.querySelector(".main-trackInfo-genres");
+        if (existingGenresElement) existingGenresElement.remove();
+        hideElementById('settingsMenu');
+    }
+
+    function removeElementById(id) {
+        const element = document.getElementById(id);
+        if (element) element.remove();
     }
 
     function createSettingsMenu() {
-        const existing = document.getElementById('settingsMenu');
-        if (existing) existing.remove();
+        const existingSettingsMenu = document.getElementById('settingsMenu');
+        if (existingSettingsMenu) {
+            existingSettingsMenu.remove();
+        }
 
         const settingsMenu = createDivElement('settingsMenu');
 
@@ -384,95 +389,109 @@
         const optionsDiv = document.createElement('div');
         optionsDiv.id = 'optionsDiv';
 
-        optionsDiv.appendChild(createNativeDropdown("position", "Position", positions));
-        optionsDiv.appendChild(createNativeDropdown("dateFormat", "Date Format", dateformat));
-        optionsDiv.appendChild(createNativeDropdown("separator", "Separator style", separator));
+        const positionDropdown = createNativeDropdown("position", "Position", positions);
+        optionsDiv.appendChild(positionDropdown);
 
-        // Debug toggle (UI toggles localStorage and runtime variable)
-        const debugDiv = document.createElement('div');
-        debugDiv.style.marginTop = '8px';
-        debugDiv.innerHTML = `<label style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="nprd-debug-ui"> Debug logs</label>`;
-        optionsDiv.appendChild(debugDiv);
+        const dateFormatDropdown = createNativeDropdown("dateFormat", "Date Format", dateformat);
+        optionsDiv.appendChild(dateFormatDropdown);
+
+        const separatorDropdown = createNativeDropdown("separator", "Separator style", separator);
+        optionsDiv.appendChild(separatorDropdown);
 
         settingsMenu.appendChild(optionsDiv);
-        document.body.appendChild(settingsMenu);
 
-        const debugCheckbox = document.getElementById('nprd-debug-ui');
-        if (debugCheckbox) {
-            debugCheckbox.checked = debugMode;
-            debugCheckbox.addEventListener('change', (e) => {
-                const val = e.target.checked ? 'true' : 'false';
-                localStorage.setItem('nprd-debug', val);
-                debugMode = val === 'true';
-                window.__NPRD_debug = debugMode;
-                console.log('[NPRD] Debug set to', debugMode, '- re-paste the script to fully reinitialize with new debug state.');
-            });
-        }
-
-        // Populate current track album info and parsed date for convenience
         getTrackDetailsRD().then(({ album, releaseDateString }) => {
             if (!album) return;
-            try {
-                const albumLink = document.createElement('a');
-                albumLink.href = album.external_urls?.spotify || '#';
-                albumLink.style.display = 'flex';
-                albumLink.style.gap = '1rem';
-                albumLink.style.marginTop = '0.5rem';
-                albumLink.style.alignItems = 'center';
+            const albumLinkElement = document.createElement('a');
+            albumLinkElement.href = album.external_urls?.spotify || '#';
+            albumLinkElement.style.display = 'flex';
+            albumLinkElement.style.gap = '1rem';
+            albumLinkElement.style.marginTop = '0.5rem';
+            albumLinkElement.style.alignItems = 'center';
 
-                const img = document.createElement('img');
-                img.src = (album.images && album.images[1] && album.images[1].url) || (album.images && album.images[0] && album.images[0].url) || '';
-                img.width = 64; img.height = 64; img.style.objectFit = 'cover'; img.style.borderRadius = '4px';
+            const albumImageElement = document.createElement('img');
+            albumImageElement.src = (album.images && album.images[1] && album.images[1].url) || (album.images[0] && album.images[0].url) || '';
+            albumImageElement.width = 64;
+            albumImageElement.height = 64;
+            albumImageElement.style.objectFit = 'cover';
+            albumImageElement.style.borderRadius = '4px';
 
-                const info = document.createElement('div');
-                info.style.display = 'flex'; info.style.flexDirection = 'column'; info.style.gap = '4px';
+            const albumContainer = document.createElement('div');
+            albumContainer.style.display = 'flex';
+            albumContainer.style.flexDirection = 'column';
+            albumContainer.style.gap = '4px';
 
-                const name = document.createElement('p'); name.textContent = `${album.name} - ${album.artists && album.artists[0] ? album.artists[0].name : ''}`; name.style.margin = '0';
-                const type = document.createElement('p'); type.textContent = album.album_type || ''; type.style.cssText = 'text-transform:capitalize;margin:0;color:var(--text-subdued);font-size:0.9rem;';
+            const albumNameElement = document.createElement('p');
+            albumNameElement.textContent = `${album.name} - ${album.artists && album.artists[0] ? album.artists[0].name : ''}`;
+            albumNameElement.style.margin = '0';
 
-                info.appendChild(name); info.appendChild(type);
-                albumLink.appendChild(img); albumLink.appendChild(info);
-                settingsMenu.appendChild(albumLink);
+            const albumTypeElement = document.createElement('p');
+            albumTypeElement.textContent = album.album_type || '';
+            albumTypeElement.style.cssText = "text-transform: capitalize; margin: 0; color: var(--text-subdued); font-size: 0.9rem;";
 
-                if (releaseDateString) {
-                    const rd = document.createElement('p'); rd.textContent = `Parsed release date: ${releaseDateString}`; rd.style.margin = '6px 0 0 0'; rd.style.color = 'var(--text-subdued)';
-                    settingsMenu.appendChild(rd);
-                }
-            } catch (e) { log('could not populate settings album UI', e); }
-        }).catch(e => log('could not get track details for settings menu', e));
+            albumContainer.appendChild(albumNameElement);
+            albumContainer.appendChild(albumTypeElement);
+            albumLinkElement.appendChild(albumImageElement);
+            albumLinkElement.appendChild(albumContainer);
+
+            settingsMenu.appendChild(albumLinkElement);
+
+            if (releaseDateString) {
+                const rd = document.createElement('p');
+                rd.textContent = `Parsed release date: ${releaseDateString}`;
+                rd.style.margin = '6px 0 0 0';
+                rd.style.color = 'var(--text-subdued)';
+                settingsMenu.appendChild(rd);
+            }
+        }).catch(e => console.warn('Could not populate album info in settings menu:', e));
+
+        document.body.appendChild(settingsMenu);
     }
 
     function createNativeDropdown(id, label, options) {
-        const container = document.createElement('div');
-        container.classList.add('Dropdown-container');
-        container.style.marginTop = '6px';
+        const dropdownContainer = document.createElement("div");
+        dropdownContainer.classList.add('Dropdown-container');
 
-        const labelEl = document.createElement('label'); labelEl.textContent = label;
-        container.appendChild(labelEl);
+        const labelElement = document.createElement("label");
+        labelElement.textContent = label;
+        dropdownContainer.appendChild(labelElement);
 
-        const select = document.createElement('select'); select.id = id; select.classList.add('releaseDateDropdown-control');
-        options.forEach(opt => {
-            const o = document.createElement('option'); o.value = opt.value; o.textContent = opt.text;
-            if (localStorage.getItem(id) === opt.value) o.selected = true;
-            select.appendChild(o);
+        const selectElement = document.createElement("select");
+        selectElement.id = id;
+        selectElement.classList.add('releaseDateDropdown-control');
+
+        options.forEach(option => {
+            const optionElement = document.createElement("option");
+            optionElement.value = option.value;
+            optionElement.textContent = option.text;
+            if (localStorage.getItem(id) === option.value) {
+                optionElement.selected = true;
+            }
+            selectElement.appendChild(optionElement);
         });
-        select.addEventListener('change', async () => {
-            localStorage.setItem(id, select.value);
+
+        selectElement.addEventListener('change', async function () {
+            localStorage.setItem(id, selectElement.value);
             await displayReleaseDate();
         });
-        container.appendChild(select);
-        return container;
+
+        dropdownContainer.appendChild(selectElement);
+
+        return dropdownContainer;
     }
 
     function toggleSettingsMenu(dateElement, settingsMenu) {
         const rect = dateElement.getBoundingClientRect();
+
         settingsMenu.style.position = 'fixed';
+        // place the menu above the clicked element where possible
         settingsMenu.style.left = `${Math.max(8, rect.left)}px`;
-        const topCandidate = rect.top - settingsMenu.offsetHeight - 8;
-        const bottomCandidate = rect.bottom + 8;
-        settingsMenu.style.top = `${topCandidate > 8 ? topCandidate : bottomCandidate}px`;
+        settingsMenu.style.top = `${Math.max(8, rect.top - settingsMenu.offsetHeight - 8)}px`;
+
+        // toggle display
         settingsMenu.style.display = settingsMenu.style.display === 'flex' ? 'none' : 'flex';
 
+        // close when clicking outside
         document.removeEventListener('click', closeSettingsMenu);
         setTimeout(() => document.addEventListener('click', closeSettingsMenu), 0);
 
@@ -484,45 +503,56 @@
         }
     }
 
+    function refreshSettingsMenu() {
+        const settingsMenu = document.getElementById('settingsMenu');
+        if (settingsMenu) {
+            settingsMenu.remove();
+        }
+        createSettingsMenu();
+    }
+
     async function initializeRD() {
         try {
             await waitForSpicetify();
-            // Attach CSS
+
+            // add CSS early
             const existingStyle = document.getElementById('nprd-style');
             if (existingStyle) existingStyle.remove();
+
             document.head.appendChild(await releaseDateCSS());
 
-            // Ensure single songchange handler
-            if (state.songChangeHandler && Spicetify?.Player?.removeEventListener) {
-                try { Spicetify.Player.removeEventListener('songchange', state.songChangeHandler); } catch (e) {}
-                state.songChangeHandler = null;
-            }
-
-            state.songChangeHandler = async () => {
+            // song change handler
+            let debounceTimer = null;
+            const handler = async () => {
                 removeExistingReleaseDateElement();
-                // small debounce to allow Spotify to update DOM
-                setTimeout(async () => {
+                if (debounceTimer) clearTimeout(debounceTimer);
+                debounceTimer = setTimeout(async () => {
                     await displayReleaseDate();
                     refreshSettingsMenu();
                 }, 200);
             };
 
-            if (Spicetify?.Player?.addEventListener) Spicetify.Player.addEventListener('songchange', state.songChangeHandler);
+            // ensure single registration
+            if (state.songChangeHandler && Spicetify?.Player?.removeEventListener) {
+                try { Spicetify.Player.removeEventListener('songchange', state.songChangeHandler); } catch (e) {}
+                state.songChangeHandler = null;
+            }
+            state.songChangeHandler = handler;
+            if (Spicetify?.Player?.addEventListener) Spicetify.Player.addEventListener('songchange', handler);
 
-            // initial run
+            hideElementById('settingsMenu');
+
+            // initial attempt
             await displayReleaseDate();
             createSettingsMenu();
-            state.initialized = true;
-            log('initialized');
-        } catch (e) {
-            console.error('[NPRD] initialize error:', e);
+        } catch (error) {
+            console.error('[NPRD] Error initializing: ', error);
         }
     }
 
-    function refreshSettingsMenu() {
-        const s = document.getElementById('settingsMenu');
-        if (s) s.remove();
-        createSettingsMenu();
+    function hideElementById(id) {
+        const element = document.getElementById(id);
+        if (element) element.style.display = 'none';
     }
 
     function cleanup() {
