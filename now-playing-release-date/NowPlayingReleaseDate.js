@@ -151,21 +151,23 @@ async function releaseDateCSS() {
             background-color: var(--spice-subtext);
         }
         
+        /* Ensure the release date and separator are inline and vertically centered */
         .main-nowPlayingWidget-nowPlaying:not(#upcomingSongDiv) .main-trackInfo-artists,
         .main-nowPlayingWidget-nowPlaying:not(#upcomingSongDiv) .main-trackInfo-name,
         #releaseDate {
             display: flex;
-            gap: 3px;
+            gap: 6px;
             white-space: nowrap;
             align-items: center;
         }
         #releaseDate {
-            display: contents;
             margin-right: 8px;
+            align-items: center;
         }
-        #releaseDate a, #releaseDate p {
+        #releaseDate a, #releaseDate span {
             color: var(--text-subdued);
             cursor: pointer;
+            display: inline-block;
         }
         .main-trackInfo-genres {
             grid-area: genres;
@@ -186,10 +188,8 @@ async function releaseDateCSS() {
 }
 
 /**
- * Return an object { trackDetails, album, releaseDate (Date obj), operatingSystem }
- * This function is robust: it prefers Spicetify.Player.data.item (the in-memory structure),
- * and falls back to the Cosmos endpoint if necessary. It tolerates structural differences
- * in the API response.
+ * Return an object { trackDetails, album, releaseDate (Date obj), releaseDateString, operatingSystem }
+ * Robustly reads possible Spotify shapes (Player.data.item.*) then falls back to Cosmos.
  */
 async function getTrackDetailsRD() {
     await waitForTrackData();
@@ -198,37 +198,47 @@ async function getTrackDetailsRD() {
     let trackDetails = null;
     let album = null;
     let releaseDate = null;
+    let releaseDateString = '';
 
-    // Attempt to read release date and album data from Spicetify.Player.data.item (most stable)
+    // Try to extract from Player.data.item (preferred)
     if (item) {
         try {
-            // Some Spicetify/Spotify objects use 'release_date' in album; others use nested 'date' object.
-            const albumFromItem = item.album || item.album_urn || null;
-            if (albumFromItem) {
-                const release_date_str = albumFromItem.release_date || (albumFromItem.date && `${albumFromItem.date.year}-${String(albumFromItem.date.month || 1).padStart(2, '0')}-${String(albumFromItem.date.day || 1).padStart(2, '0')}`);
-                if (release_date_str) {
-                    // release_date may be YYYY, YYYY-MM or YYYY-MM-DD
-                    const parts = release_date_str.split("-");
+            const albumFromItem = item.album || item.album_urn || item.albumMetadata || null;
+
+            // release date variants in different Spotify versions
+            const possibleReleaseDate = albumFromItem?.release_date || albumFromItem?.releaseDate || albumFromItem?.date || item?.release_date || item?.date;
+            if (possibleReleaseDate) {
+                if (typeof possibleReleaseDate === 'string') {
+                    // formats: YYYY, YYYY-MM, YYYY-MM-DD
+                    const parts = possibleReleaseDate.split("-");
                     const year = parseInt(parts[0], 10) || 1970;
                     const month = parts[1] ? parseInt(parts[1], 10) - 1 : 0;
                     const day = parts[2] ? parseInt(parts[2], 10) : 1;
                     releaseDate = new Date(year, month, day);
+                    releaseDateString = possibleReleaseDate.length === 4
+                        ? `${year}-01-01`
+                        : possibleReleaseDate.length === 7
+                            ? `${year}-${String(month + 1).padStart(2, '0')}-01`
+                            : possibleReleaseDate;
+                } else if (typeof possibleReleaseDate === 'object' && (possibleReleaseDate.year || possibleReleaseDate.month)) {
+                    releaseDate = new Date(possibleReleaseDate.year, (possibleReleaseDate.month || 1) - 1, possibleReleaseDate.day || 1);
+                    releaseDateString = `${possibleReleaseDate.year}-${String(possibleReleaseDate.month || 1).padStart(2, '0')}-${String(possibleReleaseDate.day || 1).padStart(2, '0')}`;
                 }
+            }
 
+            if (albumFromItem) {
                 const artists = albumFromItem.artists || albumFromItem.artist || item.artists || item.artist || [];
-                const images = (albumFromItem.images && albumFromItem.images.length) ? albumFromItem.images :
-                    (albumFromItem.cover_group && albumFromItem.cover_group.image) ? albumFromItem.cover_group.image.map(img => ({ url: img.file_id })) : [];
-
+                const images = albumFromItem.images?.length ? albumFromItem.images :
+                    (albumFromItem.cover_group?.image?.length ? albumFromItem.cover_group.image : []);
                 album = {
                     name: albumFromItem.name || albumFromItem.title || '',
                     artists: Array.isArray(artists) ? artists.map(a => ({ name: a.name || a })) : [{ name: artists.name || artists }],
                     album_type: albumFromItem.album_type || 'album',
-                    gid: albumFromItem.gid || albumFromItem.id || (item.uri ? item.uri.split(':')[2] : ''),
+                    gid: albumFromItem.gid || albumFromItem.id || '',
                     external_urls: {
-                        spotify: albumFromItem.external_urls?.spotify || (item && item.external_urls && item.external_urls.spotify) || (item && item.uri ? `spotify:album:${albumFromItem.gid || ''}` : '')
+                        spotify: albumFromItem.external_urls?.spotify || item?.external_urls?.spotify || ''
                     },
-                    images: images.map(img => {
-                        // if the image object is like { url }, keep it; if it's file_id, construct URL
+                    images: (images || []).map(img => {
                         if (img.url && img.url.startsWith('http')) return { url: img.url, width: img.width || 64, height: img.height || 64 };
                         if (img.file_id) return { url: `https://i.scdn.co/image/${img.file_id}`, width: img.width || 64, height: img.height || 64 };
                         return { url: img, width: 64, height: 64 };
@@ -236,21 +246,20 @@ async function getTrackDetailsRD() {
                 };
             }
         } catch (e) {
-            console.warn('Error parsing item album data, will fallback to Cosmos if needed', e);
+            console.warn('Error parsing Player.item album data; will try Cosmos fallback', e);
         }
     }
 
-    // If we don't have releaseDate or album info, attempt Cosmos endpoint (older approach)
-    if (!releaseDate || !album) {
+    // Cosmos fallback (defensive)
+    if ((!releaseDate || !album) && item?.uri) {
         try {
-            const trackId = item?.uri ? item.uri.split(":")[2] : null;
+            const trackId = item.uri.split(":")[2];
             if (trackId) {
                 const hexId = spotifyHex(trackId);
                 trackDetails = await Spicetify.CosmosAsync.get(`https://spclient.wg.spotify.com/metadata/4/track/${hexId}?market=from_token`);
-                // trackDetails.album may have different shapes; be defensive
                 const alb = trackDetails?.album || trackDetails?.albumData || null;
                 if (alb) {
-                    const dateObj = alb.date || alb.release_date || null;
+                    const dateObj = alb.date || alb.release_date || alb.releaseDate || null;
                     if (dateObj) {
                         if (typeof dateObj === 'string') {
                             const parts = dateObj.split("-");
@@ -258,9 +267,10 @@ async function getTrackDetailsRD() {
                             const month = parts[1] ? parseInt(parts[1], 10) - 1 : 0;
                             const day = parts[2] ? parseInt(parts[2], 10) : 1;
                             releaseDate = new Date(year, month, day);
+                            releaseDateString = dateObj.length === 4 ? `${year}-01-01` : (dateObj.length === 7 ? `${year}-${String(month + 1).padStart(2, '0')}-01` : dateObj);
                         } else {
-                            // older format { year, month, day }
                             releaseDate = new Date(dateObj.year, (dateObj.month || 1) - 1, dateObj.day || 1);
+                            releaseDateString = `${dateObj.year}-${String(dateObj.month || 1).padStart(2, '0')}-${String(dateObj.day || 1).padStart(2, '0')}`;
                         }
                     }
 
@@ -275,7 +285,7 @@ async function getTrackDetailsRD() {
                         external_urls: {
                             spotify: `spotify:album:${alb.gid || alb.id || ''}`
                         },
-                        images: coverImages.map(img => {
+                        images: (coverImages || []).map(img => {
                             if (img.file_id) return { url: `https://i.scdn.co/image/${img.file_id}`, width: img.width || 64, height: img.height || 64 };
                             if (img.url) return { url: img.url, width: img.width || 64, height: img.height || 64 };
                             return { url: img, width: 64, height: 64 };
@@ -288,7 +298,7 @@ async function getTrackDetailsRD() {
         }
     }
 
-    // final fallback: try to get basic album info from Player.data.item directly
+    // Final minimal fallback to use Player.item.album raw if we still don't have a nice album object
     if (!album && item?.album) {
         album = {
             name: item.album.name || '',
@@ -300,12 +310,17 @@ async function getTrackDetailsRD() {
         };
     }
 
-    // Normalize release_date string for use in settings UI
-    let releaseDateString = '';
-    if (releaseDate instanceof Date && !isNaN(releaseDate)) {
+    // If we have a date object but no string, normalize to string
+    if (!releaseDateString && releaseDate instanceof Date && !isNaN(releaseDate)) {
         releaseDateString = `${releaseDate.getFullYear()}-${String(releaseDate.getMonth() + 1).padStart(2, '0')}-${String(releaseDate.getDate()).padStart(2, '0')}`;
-    } else if (item?.album?.release_date) {
-        releaseDateString = item.album.release_date;
+    }
+
+    // If still empty, try some alternative fields
+    if (!releaseDateString && item?.album?.release_date) {
+        const r = item.album.release_date;
+        if (typeof r === 'string') {
+            releaseDateString = r.length === 4 ? `${r}-01-01` : r;
+        }
     }
 
     let operatingSystem = (Spicetify.Platform && Spicetify.Platform.operatingSystem) ? Spicetify.Platform.operatingSystem : null;
@@ -411,7 +426,6 @@ async function displayReleaseDate() {
             const releaseDateElement = createReleaseDateElement(localStorage.getItem('separator'), formattedReleaseDate);
             const container = findContainer(currentPosition);
             if (container) {
-                // For artist/track name containers we append; if it's a container element we can append as child
                 container.appendChild(releaseDateElement);
                 console.log('Release date element appended to:', container.className || container.tagName);
             } else {
@@ -441,10 +455,16 @@ function removeElementById(id) {
 
 function createReleaseDateElement(separator, formattedReleaseDate) {
     const releaseDateElement = createDivElement('releaseDate');
+    releaseDateElement.style.display = 'inline-flex';
+    releaseDateElement.style.alignItems = 'center';
+    releaseDateElement.style.gap = '6px';
 
     if (separator && separator.trim() !== "") {
-        const separatorElement = document.createElement("p");
+        // use span (inline) instead of p so it doesn't force a line break (fixes the dot on its own line)
+        const separatorElement = document.createElement("span");
         separatorElement.textContent = separator;
+        separatorElement.style.display = 'inline-block';
+        separatorElement.style.lineHeight = '1';
         releaseDateElement.appendChild(separatorElement);
     }
 
@@ -481,6 +501,7 @@ function createAnchorElement(textContent) {
     const anchorElement = document.createElement("a");
     anchorElement.textContent = textContent;
     anchorElement.style.cursor = 'pointer';
+    anchorElement.style.display = 'inline-block';
     return anchorElement;
 }
 
