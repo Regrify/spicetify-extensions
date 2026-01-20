@@ -11,40 +11,6 @@ async function waitForTrackData() {
     }
 }
 
-function spotifyHex(spotifyId) {
-    const INVALID = "00000000000000000000000000000000";
-    if (typeof spotifyId !== "string") {
-        return INVALID;
-    }
-    if (spotifyId.length === 0 || spotifyId.length > 22) {
-        return INVALID;
-    }
-    const characters =
-        "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    let decimalValue = BigInt(0);
-    for (let i = 0; i < spotifyId.length; i++) {
-        const index = characters.indexOf(spotifyId[i]);
-        if (index === -1) {
-            return INVALID;
-        }
-        decimalValue = decimalValue * BigInt(62) + BigInt(index);
-    }
-    const hexValue = decimalValue.toString(16).padStart(32, "0");
-    if (hexValue.length > 32) {
-        return INVALID;
-    }
-    return hexValue;
-}
-
-window.operatingSystem = window.operatingSystem || null;
-(async function () {
-    await waitForTrackData();
-    if (window.operatingSystem == null) {
-        let details = await getTrackDetailsRD();
-        window.operatingSystem = details.operatingSystem;
-    }
-})();
-
 const positions = [
     { value: ".main-nowPlayingWidget-nowPlaying:not(#upcomingSongDiv) .main-trackInfo-artists", text: "Artist" },
     { value: ".main-nowPlayingWidget-nowPlaying:not(#upcomingSongDiv) .main-trackInfo-name", text: "Song name" }
@@ -60,12 +26,131 @@ const separator = [
     { value: "‎", text: "None" },
 ]
 
+async function getTrackDetailsRD() {
+    await waitForTrackData();
+    
+    if (!Spicetify.Player.data.item || !Spicetify.Player.data.item.uri) {
+        throw new Error('No track data available');
+    }
+
+    const playerData = Spicetify.Player.data;
+    if (!playerData || !playerData.item || !playerData.item.album || !playerData.item.album.uri) {
+        throw new Error('No album URI available in player data');
+    }
+
+    const albumUri = playerData.item.album.uri;
+    const albumId = albumUri.split(':')[2];
+
+    let albumDetails;
+    try {
+        const hexAlbumId = Spicetify.URI.idToHex(Spicetify.URI.from(albumUri).id);
+        console.log('[NPRD] Trying internal album API with hex ID:', hexAlbumId);
+        
+        const albumResponse = await Spicetify.Platform.RequestBuilder.build()
+            .withHost("https://spclient.wg.spotify.com/metadata/4")
+            .withPath(`/album/${hexAlbumId}`)
+            .send();
+        
+        albumDetails = await albumResponse.body;
+        console.log('[NPRD] Internal album API response:', albumDetails);
+    } catch (internalAlbumError) {
+        if (internalAlbumError.message && internalAlbumError.message.includes('DUPLICATE_REQUEST_ERROR')) {
+            console.log('[NPRD] Duplicate request detected, trying again after delay');
+            await new Promise(resolve => setTimeout(resolve, 100));
+            try {
+                const hexAlbumId = Spicetify.URI.idToHex(Spicetify.URI.from(albumUri).id);
+                const albumResponse = await Spicetify.Platform.RequestBuilder.build()
+                    .withHost("https://spclient.wg.spotify.com/metadata/4")
+                    .withPath(`/album/${hexAlbumId}`)
+                    .send();
+                albumDetails = await albumResponse.body;
+                console.log('[NPRD] Internal album API response (retry):', albumDetails);
+            } catch (retryError) {
+                console.log('[NPRD] Retry also failed, using player data with current date:', retryError);
+                albumDetails = null;
+            }
+        } else {
+            console.log('[NPRD] Internal album API failed, using player data with current date:', internalAlbumError);
+            albumDetails = null;
+        }
+    }
+
+    if (albumDetails && albumDetails.code === 429) {
+        console.log('[NPRD] Album API rate limited (429), using player data with current date');
+        albumDetails = null;
+    }
+
+    let album;
+    let releaseDate;
+    
+    if (albumDetails && albumDetails.date) {
+        const dateInfo = albumDetails.date;
+
+        let normalizedImages = [];
+        if (albumDetails.cover_group && albumDetails.cover_group.image) {
+            normalizedImages = albumDetails.cover_group.image.map(img => ({
+                url: `https://i.scdn.co/image/${img.file_id}`,
+                width: img.width,
+                height: img.height
+            }));
+        }
+        
+        album = {
+            name: albumDetails.name || playerData.item.album.name,
+            artists: albumDetails.artist || playerData.item.album.artists,
+            album_type: albumDetails.type || 'album',
+            gid: albumDetails.gid || albumId,
+            external_urls: {
+                spotify: albumDetails.canonical_uri || albumUri
+            },
+            images: normalizedImages.length > 0 ? normalizedImages : playerData.item.album.images
+        };
+        releaseDate = new Date(dateInfo.year, dateInfo.month - 1, dateInfo.day);
+        console.log('[NPRD] Using release date from internal API:', releaseDate);
+    } else {
+        album = {
+            name: playerData.item.album.name || 'Unknown Album',
+            artists: playerData.item.album.artists ? playerData.item.album.artists.map(artist => ({ name: artist.name })) : [{ name: 'Unknown Artist' }],
+            album_type: 'album',
+            gid: playerData.item.album.uri ? playerData.item.album.uri.split(':')[2] : 'unknown',
+            external_urls: {
+                spotify: playerData.item.album.uri || ''
+            },
+            images: playerData.item.album.images || []
+        };
+        releaseDate = new Date();
+        console.log('[NPRD] No release date available, using current date as fallback');
+    }
+
+    let operatingSystem = await Spicetify.Platform.operatingSystem;
+    
+    return {
+        trackDetails: playerData.item,
+        album,
+        releaseDate,
+        operatingSystem
+    };
+}
+
+window.operatingSystem = window.operatingSystem || null;
+(async function () {
+    await waitForTrackData();
+    if (window.operatingSystem == null) {
+        try {
+            let details = await getTrackDetailsRD();
+            window.operatingSystem = details.operatingSystem;
+        } catch (error) {
+            console.error('[NPRD] Failed to get operating system:', error);
+            window.operatingSystem = "Unknown";
+        }
+    }
+})();
+
 if (!localStorage.getItem('position')) {
     localStorage.setItem('position', positions[1].value);
     localStorage.setItem('dateFormat', dateformat[0].value);
     localStorage.setItem('separator', separator[0].value);
 } else if (localStorage.getItem('position') != positions[0].value && localStorage.getItem('position') != positions[1].value) {
-    // Fallback for the position setting if it's not found in the positions array
     localStorage.setItem('position', positions[1].value);
 }
 
@@ -80,6 +165,7 @@ async function releaseDateCSS() {
         #settingsMenu {
             display: none;
             position: absolute;
+            overflow: hidden;
             background-color: var(--spice-main);
             padding: 16px;
             margin: 24px 0;
@@ -182,35 +268,6 @@ async function releaseDateCSS() {
     return ReleaseDateStyle;
 }
 
-async function getTrackDetailsRD() {
-    await waitForTrackData();
-    let trackId = Spicetify.Player.data.item.uri.split(":")[2];
-    const hexId = spotifyHex(trackId);
-    const trackDetails = await Spicetify.CosmosAsync.get(`https://spclient.wg.spotify.com/metadata/4/track/${hexId}?market=from_token`);
-    console.log('New API response:', trackDetails);
-
-    let album = {
-        name: trackDetails.album.name,
-        artists: trackDetails.album.artist.map(artist => ({ name: artist.name })),
-        album_type: 'album',
-        gid: trackDetails.album.gid,
-        external_urls: {
-            spotify: `spotify:album:${trackDetails.album.gid}`
-        },
-        images: trackDetails.album.cover_group.image.map(img => ({
-            url: `https://i.scdn.co/image/${img.file_id}`,
-            width: img.width,
-            height: img.height
-        }))
-    };
-
-    const dateObj = trackDetails.album.date;
-    const releaseDate = new Date(dateObj.year, dateObj.month - 1, dateObj.day || 1);
-    album.release_date = `${dateObj.year}-${String(dateObj.month).padStart(2, '0')}-${String(dateObj.day || 1).padStart(2, '0')}`;
-
-    let operatingSystem = await Spicetify.Platform.operatingSystem;
-    return { trackDetails, album, releaseDate, operatingSystem };
-}
 
 (async function () {
     await initializeRD();
@@ -226,8 +283,12 @@ async function initializeRD() {
             removeExistingReleaseDateElement();
             if (!debounceTimer) {
                 debounceTimer = setTimeout(async () => {
-                    await displayReleaseDate();
-                    refreshSettingsMenu();
+                    try {
+                        await displayReleaseDate();
+                        refreshSettingsMenu();
+                    } catch (error) {
+                        console.error('[NPRD] Error in songchange handler:', error);
+                    }
                     debounceTimer = null;
                 }, 1);
             }
@@ -238,14 +299,18 @@ async function initializeRD() {
         if (window.operatingSystem === "Windows") {
             await Spicetify.Player.dispatchEvent(new Event('songchange'));
         } else {
-            await displayReleaseDate();
+            try {
+                await displayReleaseDate();
+            } catch (error) {
+                console.error('[NPRD] Error in initial display:', error);
+            }
         }
 
         document.head.appendChild(await releaseDateCSS());
 
         createSettingsMenu();
     } catch (error) {
-        console.error('Error initializing: ', error, "\nCreate a new issue on the github repo to get this resolved");
+        console.error('[NPRD] Error initializing: ', error, "\nCreate a new issue on the github repo to get this resolved");
     }
 }
 
@@ -279,33 +344,65 @@ async function displayReleaseDate() {
         removeExistingReleaseDateElement();
 
         const currentPosition = localStorage.getItem('position');
-        console.log('Current position:', currentPosition);
+        console.log('[NPRD] Current position:', currentPosition);
 
         if (currentPosition.includes('genres')) {
-            console.log('Creating genres container...');
+            console.log('[NPRD] Creating genres container...');
             const trackInfoContainer = document.querySelector(".main-nowPlayingWidget-trackInfo .main-trackInfo-container");
-            console.log('Track info container found:', !!trackInfoContainer);
+            console.log('[NPRD] Track info container found:', !!trackInfoContainer);
 
             if (trackInfoContainer) {
                 const genresPlaceholder = document.createElement("div");
                 genresPlaceholder.className = "main-trackInfo-genres";
                 genresPlaceholder.textContent = "Genres Position";
                 trackInfoContainer.appendChild(genresPlaceholder);
-                console.log('Genres container created and appended');
+                console.log('[NPRD] Genres container created and appended');
             }
         }
 
         setTimeout(() => {
             const releaseDateElement = createReleaseDateElement(localStorage.getItem('separator'), formattedReleaseDate);
-            const container = document.querySelector(localStorage.getItem('position'));
-            console.log('Target container found:', !!container);
+            const selector = localStorage.getItem('position');
+            console.log('[NPRD] Looking for selector:', selector);
+            const container = document.querySelector(selector);
+            console.log('[NPRD] Target container found:', !!container);
+
+            if (!container) {
+                console.log('[NPRD] Available elements:', document.querySelectorAll('.main-trackInfo-name, .main-trackInfo-artists'));
+                console.log('[NPRD] All track info elements:', document.querySelectorAll('[class*="trackInfo"]'));
+                console.log('[NPRD] All now playing elements:', document.querySelectorAll('[class*="nowPlaying"]'));
+                console.log('[NPRD] Elements containing "name":', document.querySelectorAll('[class*="name"]'));
+                console.log('[NPRD] Current DOM structure:', document.querySelector('.main-nowPlayingWidget')?.innerHTML?.substring(0, 200));
+            }
+            
             if (container) {
                 container.appendChild(releaseDateElement);
-                console.log('Release date element appended to:', container.className);
+                console.log('[NPRD] Release date element appended to:', container.className);
+            } else {
+                console.error('[NPRD] Failed to find container for selector:', selector);
+                const fallbackSelectors = [
+                    '.main-trackInfo-name',
+                    '.main-nowPlayingWidget .main-trackInfo-name',
+                    '[data-encore-id="trackInfo"]',
+                    '.main-trackInfo-container .main-trackInfo-name',
+                    '.main-trackInfo-container [class*="name"]',
+                    '.main-nowPlayingWidget-trackInfo [class*="name"]'
+                ];
+                
+                for (const fallbackSelector of fallbackSelectors) {
+                    const fallbackContainer = document.querySelector(fallbackSelector);
+                    if (fallbackContainer) {
+                        console.log('[NPRD] Found fallback container:', fallbackSelector);
+                        fallbackContainer.appendChild(releaseDateElement);
+                        console.log('[NPRD] Release date element appended to fallback container');
+                        return;
+                    }
+                }
+                console.error('[NPRD] All fallback selectors failed');
             }
         }, 50);
     } catch (error) {
-        console.error('Error displaying release date:', error);
+        console.error('[NPRD] Error displaying release date:', error);
     }
 }
 
@@ -405,15 +502,22 @@ function createSettingsMenu() {
         const albumLinkElement = document.createElement('a');
         albumLinkElement.href = album.external_urls.spotify;
 
-        const albumImageElement = document.createElement('img');
-        albumImageElement.src = album.images[1].url;
-        albumImageElement.width = 64;
-        albumImageElement.height = 64;
-        albumImageElement.style.marginRight = '1rem';
-        albumImageElement.style.objectFit = 'cover';
+        let albumImage;
+        if (album.images && album.images.length > 0) {
+            const smallImage = album.images.find(img => img.size === 'SMALL') || album.images[0];
+            if (smallImage) {
+                albumImage = document.createElement('img');
+                albumImage.src = smallImage.url;
+                albumImage.width = 50;
+                albumImage.height = 50;
+                albumImage.style.marginRight = '1rem';
+                albumImage.style.borderRadius = '4px';
+                albumImage.style.objectFit = 'cover';
+            }
+        }
 
         const albumNameElement = document.createElement('p');
-        albumNameElement.textContent = `${album.name} - ${album.artists[0].name} \n`;
+        albumNameElement.textContent = `${album.name} - ${Array.isArray(album.artists) ? album.artists[0].name : (album.artists?.name || 'Unknown Artist')} \n`;
 
         const albumTypeElement = document.createElement('p');
         albumTypeElement.textContent = album.album_type;
@@ -423,10 +527,19 @@ function createSettingsMenu() {
 
         albumContainer.appendChild(albumNameElement);
         albumContainer.appendChild(albumTypeElement);
-        albumLinkElement.appendChild(albumImageElement);
+        
+        if (albumImage) {
+            albumLinkElement.appendChild(albumImage);
+        }
         albumLinkElement.appendChild(albumContainer);
 
         settingsMenu.appendChild(albumLinkElement);
+    }).catch(error => {
+        console.error('[NPRD] Error loading album in settings menu:', error);
+        const fallbackElement = document.createElement('p');
+        fallbackElement.textContent = 'Album information unavailable';
+        fallbackElement.style.color = 'var(--spice-subtext)';
+        settingsMenu.appendChild(fallbackElement);
     });
 
     document.body.appendChild(settingsMenu);
@@ -467,7 +580,7 @@ function createNativeDropdown(id, label, options) {
 function toggleSettingsMenu(dateElement, settingsMenu) {
     const rect = dateElement.getBoundingClientRect();
 
-    settingsMenu.style.position = 'fixed';
+    settingsMenu.style.position = 'absolute';
     settingsMenu.style.left = `${rect.left}px`;
     settingsMenu.style.bottom = `${window.innerHeight - rect.top}px`;
 
