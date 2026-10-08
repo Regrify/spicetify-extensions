@@ -1,31 +1,37 @@
 console.log('[TAGS] [Track Tags] loaded');
 
+(function () {
+
 async function waitForSpicetify() {
-    while (!Spicetify || !Spicetify.showNotification) {
+    while (typeof Spicetify === 'undefined' || !Spicetify.showNotification || !Spicetify.Player || !Spicetify.Platform) {
         await new Promise(resolve => setTimeout(resolve, 100));
     }
 }
 async function waitForTrackData() {
+    await waitForSpicetify();
     while (!Spicetify.Player.data || !Spicetify.Player.data.item) {
         await new Promise(resolve => setTimeout(resolve, 100));
     }
 }
 
+let displayToken = 0;
+let domWatcherTimer;
+
 window.operatingSystem = window.operatingSystem || null;
 (async function () {
-    await waitForTrackData();
+    await waitForSpicetify();
     if (window.operatingSystem == null) {
-        let details = await getTrackDetailsTags();
-        window.operatingSystem = details.operatingSystem;
+        window.operatingSystem = await Spicetify.Platform.operatingSystem;
     }
 })();
 
 async function tagCSS() {
     const tagStyle = document.createElement('style');
     tagStyle.innerHTML = `
-        .main-nowPlayingWidget-nowPlaying:not(#upcomingSongDiv) .main-trackInfo-enhanced {
-                align-items: center;
-            }
+        .main-nowPlayingWidget-nowPlaying:not(#upcomingSongDiv) .main-trackInfo-enhanced,
+        .main-nowPlayingWidget-nowPlaying:not(#upcomingSongDiv) .main-trackInfo-container {
+            align-items: center;
+        }
         .playing-tags {
             display: flex;
             gap: 3px;
@@ -73,25 +79,25 @@ async function tagCSS() {
 
 async function getTrackDetailsTags() {
     await waitForTrackData();
-    
+
     const playerData = Spicetify.Player.data;
     if (!playerData || !playerData.item || !playerData.item.uri) {
         throw new Error('No track data available');
     }
 
     const trackUri = playerData.item.uri;
-    const trackId = trackUri.split(':')[2];
+    const trackId = trackUri.split(':')[2] || trackUri;
 
     let trackDetails;
     try {
         const hexTrackId = Spicetify.URI.idToHex(Spicetify.URI.from(trackUri).id);
         console.log('[TAGS] Trying internal track API with hex ID:', hexTrackId);
-        
+
         const trackResponse = await Spicetify.Platform.RequestBuilder.build()
             .withHost("https://spclient.wg.spotify.com/metadata/4")
             .withPath(`/track/${hexTrackId}`)
             .send();
-        
+
         trackDetails = await trackResponse.body;
         console.log('[TAGS] Internal track API response:', JSON.stringify(trackDetails, null, 2));
     } catch (internalTrackError) {
@@ -106,24 +112,24 @@ async function getTrackDetailsTags() {
 
     console.log('[TAGS] Player data available:', JSON.stringify(playerData, null, 2));
     console.log('[TAGS] Track details from API:', trackDetails);
-    
+
     const normalizedTrackDetails = {
         id: trackId,
         uri: trackUri,
         name: trackDetails?.name || playerData.item.name,
-        explicit: trackDetails?.explicit ?? playerData.item.explicit ?? playerData.item.metadata?.is_explicit === 'true' ?? false,
+        explicit: trackDetails?.explicit ?? playerData.item.explicit ?? (playerData.item.metadata?.is_explicit === 'true'),
         album: {
-            name: trackDetails?.album?.name || playerData.item.album.name,
-            uri: trackDetails?.album?.uri || playerData.item.album.uri
+            name: trackDetails?.album?.name || playerData.item.album?.name || '',
+            uri: trackDetails?.album?.uri || playerData.item.album?.uri || ''
         },
-        artists: trackDetails?.artist || playerData.item.artists
+        artists: trackDetails?.artist || playerData.item.artists || []
     };
 
     console.log('[TAGS] Normalized track details:', JSON.stringify(normalizedTrackDetails, null, 2));
 
     let savedTrack = [false];
     let likedSongs = { items: [] };
-    
+
     try {
         if (Spicetify.Player && Spicetify.Player.data && Spicetify.Player.data.item) {
             const isLiked = Spicetify.Player.data.item.metadata?.['collection.in_collection'] === 'true';
@@ -137,7 +143,8 @@ async function getTrackDetailsTags() {
 
     let downloadedSongs = { items: [] };
     try {
-        downloadedSongs = await Spicetify.Platform.OfflineAPI._offline.getItems(0, Spicetify.Platform.OfflineAPI._offline.getItems.length);
+        const offlineResponse = await Spicetify.Platform.OfflineAPI._offline.getItems(0, 10000);
+        downloadedSongs = { items: Array.isArray(offlineResponse?.items) ? offlineResponse.items : [] };
         console.log('[TAGS] Downloaded songs count:', downloadedSongs.items.length);
     } catch (downloadError) {
         console.log('[TAGS] Could not get downloaded songs:', downloadError);
@@ -159,15 +166,23 @@ async function initializeTags() {
         await waitForSpicetify();
 
         let debounceTimer;
-        Spicetify.Player.addEventListener("songchange", async () => {
+        Spicetify.Player.addEventListener("songchange", () => {
             removeExistingTagElement();
-            if (!debounceTimer) {
-                debounceTimer = setTimeout(async () => {
-                    await displayTags();
-                    debounceTimer = null;
-                }, 1);
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => {
+                displayTags();
+            }, 1);
+        });
+
+        // Spotify re-renders the now-playing widget often, wiping injected tags.
+        // Re-inject them whenever the container exists but our tags are gone.
+        const domWatcher = new MutationObserver(() => {
+            if (!document.querySelector('.playing-tags') && findTrackInfoContainer()) {
+                clearTimeout(domWatcherTimer);
+                domWatcherTimer = setTimeout(() => displayTags(), 150);
             }
         });
+        domWatcher.observe(document.body, { childList: true, subtree: true });
 
         if (window.operatingSystem === "Windows") {
             await Spicetify.Player.dispatchEvent(new Event('songchange'));
@@ -181,17 +196,44 @@ async function initializeTags() {
     }
 }
 
-async function displayTags() {
+const TRACK_INFO_SELECTORS = [
+    '.main-trackInfo-enhanced',
+    '.main-trackInfo-container',
+    '.main-trackInfo-artists',
+];
+
+function findTrackInfoContainer() {
+    const widget = document.querySelector('.main-nowPlayingWidget-nowPlaying:not(#upcomingSongDiv)');
+    if (!widget) return null;
+
+    for (const selector of TRACK_INFO_SELECTORS) {
+        const el = widget.querySelector(selector);
+        if (el) {
+            // `.main-trackInfo-artists` is the artist row itself; attach to its
+            // parent so the tags render as their own row, not inside it.
+            return selector === '.main-trackInfo-artists' ? el.parentElement : el;
+        }
+    }
+    return null;
+}
+
+async function displayTags(retries = 10) {
+    const token = ++displayToken;
     let downloaded = false;
     try {
-        const { trackDetails, savedTrack, downloadedSongs } = await getTrackDetailsTags();
+        const Tagslist = findTrackInfoContainer();
 
-        const Tagslist = document.querySelector('.main-nowPlayingWidget-nowPlaying:not(#upcomingSongDiv) .main-trackInfo-enhanced');
-        
         if (!Tagslist) {
-            console.error('[TAGS] Could not find track info container to display tags');
+            if (retries > 0) {
+                setTimeout(() => displayTags(retries - 1), 500);
+            } else {
+                console.error('[TAGS] Could not find track info container to display tags');
+            }
             return;
         }
+
+        const { trackDetails, savedTrack, downloadedSongs } = await getTrackDetailsTags();
+        if (token !== displayToken) return; // superseded by a newer call
 
         const tagsDiv = document.createElement('div');
         tagsDiv.setAttribute('class', 'playing-tags');
@@ -199,25 +241,28 @@ async function displayTags() {
         const nowPlayingPlaylistDetails = await Spicetify.Platform.PlayerAPI.getState();
 
         downloadedSongs.items.forEach(song => {
-            if (song.uri.includes(trackDetails.id)) {
+            if (song?.uri?.includes(trackDetails.id)) {
                 downloaded = true;
             }
         });
 
 
-        if (nowPlayingPlaylistDetails.context.uri) {
+        if (nowPlayingPlaylistDetails?.context?.uri) {
             const split = nowPlayingPlaylistDetails.context.uri.split(':');
             const contextType = split[1];
             const playlistName = nowPlayingPlaylistDetails.context.format_list_type;
-            
+
             console.log('[TAGS] Context URI:', nowPlayingPlaylistDetails.context.uri);
             console.log('[TAGS] Split URI:', split);
             console.log('[TAGS] Context type:', contextType);
             console.log('[TAGS] Playlist name:', playlistName);
 
+            let playlistImgSrc;
+            let songLocation;
+
             const playlistSpan = document.createElement('span');
             playlistSpan.setAttribute('class', 'Wrapper-sm-only Wrapper-small-only');
-            
+
             if (contextType === "user" && split[3] === "collection") {
                 console.log('[TAGS] Detected user collection, treating as Liked Songs');
                 playlistImgSrc = "https://misc.scdn.co/liked-songs/liked-songs-300.png";
@@ -228,14 +273,14 @@ async function displayTags() {
                 songLocation = `/${split[3]}/tracks?uri=${trackDetails.uri}`;
                 playlistSpan.setAttribute('title', `Playing from Liked Songs`);
             } else {
-                const imageUrl = nowPlayingPlaylistDetails.context.metadata.image_url;
+                const imageUrl = nowPlayingPlaylistDetails.context.metadata?.image_url;
                 if (imageUrl && imageUrl !== 'undefined') {
                     playlistImgSrc = "https://image-cdn-ak.spotifycdn.com/image/" + imageUrl;
                 } else {
                     playlistImgSrc = "https://raw.githubusercontent.com/Plueres/spicetify-extensions/main/track-tags/spotify_playlist.webp";
                 }
                 songLocation = `/${split[1]}/${split[2]}?uid=${nowPlayingPlaylistDetails.item.uid}`;
-                playlistSpan.setAttribute('title', `Playing from ${nowPlayingPlaylistDetails.context.metadata.context_description || 'Playlist'}`);
+                playlistSpan.setAttribute('title', `Playing from ${nowPlayingPlaylistDetails.context.metadata?.context_description || 'Playlist'}`);
             }
             playlistSpan.onclick = function () { Spicetify.Platform.History.push(songLocation); };
 
@@ -272,7 +317,7 @@ async function displayTags() {
             savedTrackSpan.onclick = async function () {
                 if (confirm('Are you sure you want to remove this song from your liked songs?')) {
                     Spicetify.Player.toggleHeart();
-                    await removeExistingTagElement();
+                    removeExistingTagElement();
                     setTimeout(() => {
                         displayTags();
                     }, 1000);
@@ -314,12 +359,16 @@ async function displayTags() {
             tagsDiv.appendChild(explicitSpan);
         }
 
+        if (tagsDiv.childElementCount === 0) return;
+        removeExistingTagElement();
         Tagslist.prepend(tagsDiv);
     } catch (error) {
                 console.error('[TAGS] Error displaying tags: ', error);
     }
 }
 function removeExistingTagElement() {
-    const existingTagElements = document.querySelectorAll('.main-nowPlayingWidget-nowPlaying:not(#upcomingSongDiv) .main-trackInfo-enhanced .playing-tags');
+    const existingTagElements = document.querySelectorAll('.playing-tags');
     existingTagElements.forEach(element => element.remove());
 }
+
+})();
