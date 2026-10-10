@@ -298,10 +298,18 @@ async function initializeRD() {
         });
 
         // Re-inject the date if Spotify re-renders the widget and wipes it.
+        // The element is considered missing only if it's still missing when the
+        // timer fires. displayReleaseDate() itself removes and re-adds the
+        // element, so without this re-check the observer would reschedule
+        // displayReleaseDate() forever (flicker + endless API requests).
+        const needsReleaseDate = () =>
+            !document.getElementById('nprd-releaseDate') && document.querySelector(storageGet('position'));
         const domWatcher = new MutationObserver(() => {
-            if (!document.getElementById('nprd-releaseDate') && document.querySelector(storageGet('position'))) {
+            if (needsReleaseDate()) {
                 clearTimeout(rdDomWatcherTimer);
-                rdDomWatcherTimer = setTimeout(() => displayReleaseDate(), 150);
+                rdDomWatcherTimer = setTimeout(() => {
+                    if (needsReleaseDate()) displayReleaseDate();
+                }, 150);
             }
         });
         domWatcher.observe(document.body, { childList: true, subtree: true });
