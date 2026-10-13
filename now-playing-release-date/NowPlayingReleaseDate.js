@@ -2,35 +2,40 @@ console.log('[Now Playing Release Date] loaded');
 
 (function () {
 
-async function waitForSpicetify() {
-    while (typeof Spicetify === 'undefined' || !Spicetify.showNotification || !Spicetify.Player || !Spicetify.Platform) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-    }
-}
-async function waitForTrackData() {
-    await waitForSpicetify();
-    while (!Spicetify.Player.data || !Spicetify.Player.data.item) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-    }
-}
+const positions = Object.freeze([
+    { value: ".main-nowPlayingWidget-nowPlaying .main-trackInfo-artists", text: "Artist" },
+    { value: ".main-nowPlayingWidget-nowPlaying .main-trackInfo-name", text: "Song name" },
+    { value: ".main-nowPlayingWidget-nowPlaying .main-nowPlayingWidget-trackInfo > *:last-child", text: "Lossless badge" },
+]);
 
-const positions = [
-    { value: ".main-nowPlayingWidget-nowPlaying:not(#upcomingSongDiv) .main-trackInfo-artists", text: "Artist" },
-    { value: ".main-nowPlayingWidget-nowPlaying:not(#upcomingSongDiv) .main-trackInfo-name", text: "Song name" }
-];
-const dateformat = [
-    { value: "DD-MM-YYYY", text: "DD-MM-YYYY" },
-    { value: "MM-DD-YYYY", text: "MM-DD-YYYY" },
-    { value: "YYYY-MM-DD", text: "YYYY-MM-DD" }
-];
-const separator = [
-    { value: "•", text: "Dot" },
-    { value: "-", text: "Dash" },
-    { value: " ", text: "None" },
-];
+const dateformat = Object.freeze([
+    { value: "DD-MM-YYYY", text: "Day-Month-Year" },
+    { value: "MM-DD-YYYY", text: "Month-Day-Year" },
+    { value: "YYYY-MM-DD", text: "Year-Month-Day" }
+]);
 
-// Prefix storage keys so other extensions using 'position'/'dateFormat'/etc.
-// don't overwrite ours (and vice versa).
+const dateseparator = Object.freeze([
+    { value: "-", text: "Dash (-)" },
+    { value: "/", text: "Slash (/)" },
+    { value: ".", text: "Dot (.)" },
+    { value: " ", text: "Space" },
+    { value: "", text: "None" }
+]);
+
+const separator = Object.freeze([
+    { value: "•", text: "Dot (•)" },
+    { value: "*", text: "Star (*)" },
+    { value: "-", text: "Dash (-)" },
+    { value: "/", text: "Slash (/)" },
+    { value: "|", text: "Pipe (|)" },
+    { value: "()", text: "Parentheses ()" },
+    { value: "[]", text: "Brackets []" },
+    { value: "{}", text: "Braces {}" },
+    { value: "<>", text: "Angle Brackets <>" },
+    { value: " ", text: "Space" },
+    { value: "", text: "None" }
+]);
+
 const LS_PREFIX = 'nprd.';
 function storageGet(key) {
     return localStorage.getItem(LS_PREFIX + key);
@@ -39,59 +44,157 @@ function storageSet(key, value) {
     localStorage.setItem(LS_PREFIX + key, value);
 }
 
+for (const key of ['position', 'dateFormat', 'separator', 'dateSeparator']) {
+    if (storageGet(key) === null) {
+        const legacy = localStorage.getItem(key);
+        if (legacy !== null) storageSet(key, legacy);
+    }
+}
+
+if (!storageGet('position')) {
+    storageSet('position', positions[1].value);
+    storageSet('dateFormat', dateformat[0].value);
+    storageSet('dateSeparator', dateseparator[0].value);
+    storageSet('separator', separator[0].value);
+} else if (!positions.some(p => p.value === storageGet('position'))) {
+    storageSet('position', positions[1].value);
+}
+
+if (!storageGet('dateSeparator')) {
+    storageSet('dateSeparator', dateseparator[0].value);
+}
+
+const albumCache = new Map();
+const albumInFlight = new Map();
+const trackCache = new Map();
+const CACHE_MAX = 100;
+
+function cacheTrack(trackId, data) {
+    if (trackCache.size >= CACHE_MAX) {
+        const firstKey = trackCache.keys().next().value;
+        if (firstKey) trackCache.delete(firstKey);
+    }
+    trackCache.set(trackId, data);
+}
+
+async function waitUntil(predicate, opts = {}) {
+    const { initial = 50, max = 500, timeout = 15000 } = opts;
+    let delay = initial;
+    const start = Date.now();
+    if (predicate()) return;
+    while (!predicate()) {
+        if (Date.now() - start > timeout) throw new Error('waitUntil timeout');
+        await new Promise(r => setTimeout(r, delay));
+        delay = Math.min(max, Math.floor(delay * 1.5));
+    }
+}
+
+async function waitForSpicetify() {
+    await waitUntil(() => typeof Spicetify !== 'undefined' && Spicetify?.showNotification && Spicetify?.Player && Spicetify?.Platform);
+}
+
+async function waitForTrackData() {
+    await waitForSpicetify();
+    await waitUntil(() => {
+        const item = Spicetify?.Player?.data?.item;
+        if (!item) return false;
+        if (!item.uri?.includes(':track:')) return true;
+        return !!item.album?.uri;
+    });
+}
+
+async function fetchAlbumDetails(albumUri) {
+    if (!albumUri) return null;
+    let hexAlbumId;
+    try {
+        const uriObj = Spicetify.URI?.from?.(albumUri);
+        if (!uriObj || !uriObj.id) return null;
+        hexAlbumId = Spicetify.URI.idToHex(uriObj.id);
+    } catch (e) {
+        console.error('[NPRD] Invalid album URI:', albumUri, e);
+        return null;
+    }
+
+    if (albumCache.has(hexAlbumId)) {
+        return albumCache.get(hexAlbumId);
+    }
+
+    if (albumInFlight.has(hexAlbumId)) {
+        return albumInFlight.get(hexAlbumId);
+    }
+
+    const fetchPromise = (async () => {
+        const executeFetch = async () => {
+            const rb = Spicetify.Platform?.RequestBuilder?.build?.();
+            if (!rb) return null;
+            const albumResponse = await rb
+                .withHost("https://spclient.wg.spotify.com/metadata/4")
+                .withPath(`/album/${hexAlbumId}`)
+                .send();
+            return albumResponse.body;
+        };
+
+        let albumDetails = null;
+        let retries = 2;
+        while (retries >= 0) {
+            try {
+                albumDetails = await executeFetch();
+                if (albumDetails) break;
+            } catch (err) {
+                if (err.message && err.message.includes('DUPLICATE_REQUEST_ERROR') && retries > 0) {
+                    await new Promise(r => setTimeout(r, 100));
+                } else {
+                    console.error('[NPRD] Internal album API failed:', err);
+                    albumDetails = null;
+                    break;
+                }
+            }
+            retries--;
+        }
+
+        if (albumDetails && albumDetails.code === 429) {
+            console.error('[NPRD] Album API rate limited (429)');
+            albumDetails = null;
+        }
+
+        if (albumDetails && albumDetails.date) {
+            albumCache.set(hexAlbumId, albumDetails);
+        }
+
+        return albumDetails;
+    })();
+
+    albumInFlight.set(hexAlbumId, fetchPromise);
+
+    try {
+        return await fetchPromise;
+    } finally {
+        albumInFlight.delete(hexAlbumId);
+    }
+}
+
 async function getTrackDetailsRD() {
     await waitForTrackData();
 
-    if (!Spicetify.Player.data.item || !Spicetify.Player.data.item.uri) {
+    const playerData = Spicetify.Player.data;
+    if (!playerData || !playerData.item || !playerData.item.uri) {
         throw new Error('No track data available');
     }
 
-    const playerData = Spicetify.Player.data;
-    if (!playerData || !playerData.item || !playerData.item.album || !playerData.item.album.uri) {
-        throw new Error('No album URI available in player data');
+    const trackUri = playerData.item.uri;
+    const trackId = trackUri.split(':')[2];
+
+    if (trackId && trackCache.has(trackId)) {
+        return trackCache.get(trackId);
     }
 
-    const albumUri = playerData.item.album.uri;
-    const albumId = albumUri.split(':')[2];
+    const albumUri = playerData.item.album?.uri;
+    const albumId = albumUri ? albumUri.split(':')[2] : 'unknown';
 
-    async function fetchAlbumDetails() {
-        const hexAlbumId = Spicetify.URI.idToHex(Spicetify.URI.from(albumUri).id);
-        console.log('[NPRD] Trying internal album API with hex ID:', hexAlbumId);
-        const albumResponse = await Spicetify.Platform.RequestBuilder.build()
-            .withHost("https://spclient.wg.spotify.com/metadata/4")
-            .withPath(`/album/${hexAlbumId}`)
-            .send();
-        return albumResponse.body;
-    }
-
-    let albumDetails;
-    try {
-        albumDetails = await fetchAlbumDetails();
-        console.log('[NPRD] Internal album API response:', albumDetails);
-    } catch (internalAlbumError) {
-        if (internalAlbumError.message && internalAlbumError.message.includes('DUPLICATE_REQUEST_ERROR')) {
-            console.log('[NPRD] Duplicate request detected, trying again after delay');
-            await new Promise(resolve => setTimeout(resolve, 100));
-            try {
-                albumDetails = await fetchAlbumDetails();
-                console.log('[NPRD] Internal album API response (retry):', albumDetails);
-            } catch (retryError) {
-                console.log('[NPRD] Retry also failed, using player data with current date:', retryError);
-                albumDetails = null;
-            }
-        } else {
-            console.log('[NPRD] Internal album API failed, using player data with current date:', internalAlbumError);
-            albumDetails = null;
-        }
-    }
-
-    if (albumDetails && albumDetails.code === 429) {
-        console.log('[NPRD] Album API rate limited (429), using player data with current date');
-        albumDetails = null;
-    }
+    const albumDetails = albumUri ? await fetchAlbumDetails(albumUri) : null;
 
     let album;
-    let releaseDate;
+    let releaseDate = null;
 
     if (albumDetails && albumDetails.date) {
         const dateInfo = albumDetails.date;
@@ -106,99 +209,139 @@ async function getTrackDetailsRD() {
         }
 
         album = {
-            name: albumDetails.name || playerData.item.album.name,
-            artists: albumDetails.artist || playerData.item.album.artists,
+            name: albumDetails.name || playerData.item.album?.name || 'Unknown Album',
+            artists: albumDetails.artist || playerData.item.album?.artists || [{ name: 'Unknown Artist' }],
             album_type: albumDetails.type || 'album',
             gid: albumDetails.gid || albumId,
             external_urls: {
-                spotify: albumDetails.canonical_uri || albumUri
+                spotify: albumDetails.canonical_uri || albumUri || ''
             },
-            images: normalizedImages.length > 0 ? normalizedImages : playerData.item.album.images
+            images: normalizedImages.length > 0 ? normalizedImages : (playerData.item.album?.images || [])
         };
-        releaseDate = new Date(dateInfo.year, dateInfo.month - 1, dateInfo.day);
-        console.log('[NPRD] Using release date from internal API:', releaseDate);
+
+        const year = dateInfo.year;
+        const month = (dateInfo.month || 1) - 1;
+        const day = dateInfo.day || 1;
+        if (year !== undefined && year !== null) {
+            releaseDate = new Date(year, month, day);
+        }
     } else {
         album = {
-            name: playerData.item.album.name || 'Unknown Album',
-            artists: playerData.item.album.artists ? playerData.item.album.artists.map(artist => ({ name: artist.name })) : [{ name: 'Unknown Artist' }],
+            name: playerData.item.album?.name || 'Unknown Album',
+            artists: playerData.item.album?.artists ? playerData.item.album.artists.map(artist => ({ name: artist.name })) : [{ name: 'Unknown Artist' }],
             album_type: 'album',
-            gid: playerData.item.album.uri ? playerData.item.album.uri.split(':')[2] : 'unknown',
+            gid: albumId,
             external_urls: {
-                spotify: playerData.item.album.uri || ''
+                spotify: albumUri || ''
             },
-            images: playerData.item.album.images || []
+            images: playerData.item.album?.images || []
         };
-        releaseDate = new Date();
-        console.log('[NPRD] No release date available, using current date as fallback');
-    }
 
-    let operatingSystem = await Spicetify.Platform.operatingSystem;
-
-    return {
-        trackDetails: playerData.item,
-        album,
-        releaseDate,
-        operatingSystem
-    };
-}
-
-let releaseDateToken = 0;
-let rdDomWatcherTimer;
-
-window.operatingSystem = window.operatingSystem || null;
-(async function () {
-    await waitForSpicetify();
-    if (window.operatingSystem == null) {
-        try {
-            window.operatingSystem = await Spicetify.Platform.operatingSystem;
-        } catch (error) {
-            console.error('[NPRD] Failed to get operating system:', error);
-            window.operatingSystem = "Unknown";
+        const metaYear = playerData.item?.metadata?.year || playerData.item?.metadata?.album_year;
+        if (metaYear) {
+            releaseDate = new Date(parseInt(metaYear, 10), 0, 1);
+        } else if (playerData.item?.album?.release_date) {
+            releaseDate = new Date(playerData.item.album.release_date);
         }
     }
-})();
 
-// Migrate settings stored under the old unprefixed keys.
-for (const key of ['position', 'dateFormat', 'separator']) {
-    if (storageGet(key) === null) {
-        const legacy = localStorage.getItem(key);
-        if (legacy !== null) storageSet(key, legacy);
+    const result = {
+        trackDetails: playerData.item,
+        album,
+        releaseDate
+    };
+
+    if (trackId) {
+        cacheTrack(trackId, result);
     }
+
+    return result;
 }
 
-if (!storageGet('position')) {
-    storageSet('position', positions[1].value);
-    storageSet('dateFormat', dateformat[0].value);
-    storageSet('separator', separator[0].value);
-} else if (storageGet('position') != positions[0].value && storageGet('position') != positions[1].value) {
-    storageSet('position', positions[1].value);
+function formatReleaseDate(releaseDate, formatPattern, dateSep) {
+    if (!(releaseDate instanceof Date) || isNaN(releaseDate.getTime())) return null;
+
+    const pad = (n) => String(n).padStart(2, '0');
+    const year = String(releaseDate.getFullYear());
+    const month = pad(releaseDate.getMonth() + 1);
+    const day = pad(releaseDate.getDate());
+
+    const sep = dateSep !== undefined && dateSep !== null ? dateSep : (storageGet('dateSeparator') ?? '-');
+
+    const orderMap = {
+        "DD-MM-YYYY": [day, month, year],
+        "MM-DD-YYYY": [month, day, year],
+        "YYYY-MM-DD": [year, month, day]
+    };
+
+    const tokens = orderMap[formatPattern] || [day, month, year];
+    return tokens.join(sep);
+}
+
+function createDivElement(id) {
+    const divElement = document.createElement("div");
+    if (id) divElement.id = id;
+    return divElement;
+}
+
+function createAnchorElement(textContent) {
+    const anchorElement = document.createElement("a");
+    anchorElement.textContent = textContent;
+    anchorElement.style.cursor = 'pointer';
+    anchorElement.setAttribute('role', 'button');
+    anchorElement.setAttribute('tabindex', '0');
+    return anchorElement;
+}
+
+function removeElementById(id) {
+    const element = document.getElementById(id);
+    if (element) element.remove();
+}
+
+function hideElementById(id) {
+    const element = document.getElementById(id);
+    if (element) element.style.display = 'none';
+}
+
+function setElementStyles(element, styles) {
+    if (styles.fontSize) element.style.fontSize = styles.fontSize;
+    if (styles.fontWeight) element.style.fontWeight = styles.fontWeight;
 }
 
 async function releaseDateCSS() {
     await waitForSpicetify();
 
     const ReleaseDateStyle = document.createElement('style');
+    ReleaseDateStyle.id = 'nprd';
     ReleaseDateStyle.innerHTML = `
         .main-nowPlayingWidget-nowPlaying:not(#upcomingSongDiv) .main-nowPlayingWidget-trackInfo {
             min-width: 14rem;
         }
+
+        .main-nowPlayingWidget-nowPlaying .main-nowPlayingWidget-trackInfo > *:last-child {
+            display: flex;
+            font-size: var(--encore-text-size-smaller-2);
+        }
         #nprd-settingsMenu {
             display: none;
-            position: absolute;
+            position: fixed;
             overflow: hidden;
             background-color: var(--spice-main);
             padding: 16px;
-            margin: 24px 0;
             border-radius: 8px;
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
             flex-direction: column;
-            min-width: 16vw;
-            max-width: 20vw;
+            min-width: 240px;
+            max-width: 320px;
+            z-index: 10001;
+            border: 1px solid var(--spice-subtext);
+            font-family: var(--font-family, sans-serif);
         }
         #nprd-settingsMenu h2 {
-            padding: 10px;
+            padding: 0 0 10px 0;
+            margin: 0;
             color: var(--spice-text);
-            font-size: 1.2rem;
+            font-size: 1.1rem;
             border-bottom: 1px solid var(--spice-subtext);
         }
         #nprd-optionsDiv {
@@ -206,7 +349,12 @@ async function releaseDateCSS() {
             flex-direction: column;
             padding: 10px 0;
         }
-        #nprd-settingsMenu a {
+        #nprd-albumInfoContainer {
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid var(--spice-subtext);
+        }
+        #nprd-albumInfoContainer a {
             display: flex;
             align-items: center;
             max-width: 100%;
@@ -216,211 +364,90 @@ async function releaseDateCSS() {
             color: var(--spice-text);
             text-decoration: none;
         }
-        #nprd-settingsMenu a:hover {
-            color: var(--spice-text-bright-accent);
+        #nprd-albumInfoContainer a:hover {
+            color: var(--spice-button-active, var(--spice-text-bright-accent));
         }
         .Dropdown-container {
-            overflow: visible; 
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-top: 10px;
+            margin-top: 8px;
             gap: 10px;
+        }
+        .Dropdown-container label {
+            color: var(--spice-text);
+            font-size: 0.85rem;
+            font-weight: 500;
         }
         .releaseDateDropdown-control {
             flex-grow: 1;
-            display: inline;
-            justify-content: space-between;
+            display: inline-block;
             border: 1px solid var(--spice-subtext);
-            padding: 5px;
+            padding: 4px 8px;
+            border-radius: 4px;
             cursor: pointer;
-            min-width: fit-content;
             max-width: 10rem;
             background-color: var(--spice-main);
             color: var(--spice-text);
-        }
-        .Dropdown-optionsList {
-            position: fixed;
-            background-color: var(--spice-main);
-            z-index: 1;
-            border: 1px solid var(--spice-subtext);
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-        }
-        .Dropdown-option {
-            padding: 5px;
-            cursor: pointer;
-            color: var(--spice-text);
-        }
-        .Dropdown-option:hover {
-            background-color: var(--spice-subtext);
+            font-size: 0.85rem;
         }
         
-        .main-nowPlayingWidget-nowPlaying:not(#upcomingSongDiv) .main-trackInfo-artists,
-        .main-nowPlayingWidget-nowPlaying:not(#upcomingSongDiv) .main-trackInfo-name,
-        #nprd-releaseDate {
-            display: flex;
-            gap: 3px;
+        .main-nowPlayingWidget-nowPlaying .main-trackInfo-artists,
+        .main-nowPlayingWidget-nowPlaying .main-trackInfo-name {
+            display: inline-flex;
+            align-items: baseline;
+            gap: 4px;
             white-space: nowrap;
         }
         #nprd-releaseDate {
-            display: contents;
-            margin-right: 8px;
+            display: inline-flex;
+            align-items: baseline;
+            gap: 4px;
+            white-space: nowrap;
+            margin: 0;
+            padding: 0;
         }
         #nprd-releaseDate a, #nprd-releaseDate p {
-            color: var(--text-subdued);
+            color: var(--text-subdued, var(--spice-subtext));
+            margin: 0 !important;
+            padding: 0 !important;
+            font-size: inherit;
+            line-height: inherit;
+            vertical-align: baseline;
+        }
+        #nprd-releaseDate p {
+            user-select: none;
+        }
+        #nprd-releaseDate a:hover {
+            color: var(--spice-text);
+            text-decoration: underline;
         }
     `;
     return ReleaseDateStyle;
 }
 
-
-(async function () {
-    await initializeRD();
-})();
-
-async function initializeRD() {
-    try {
-        await waitForSpicetify();
-
-        let debounceTimer;
-
-        Spicetify.Player.addEventListener("songchange", () => {
-            removeExistingReleaseDateElement();
-            clearTimeout(debounceTimer);
-            debounceTimer = setTimeout(async () => {
-                try {
-                    await displayReleaseDate();
-                    refreshSettingsMenu();
-                } catch (error) {
-                    console.error('[NPRD] Error in songchange handler:', error);
-                }
-            }, 1);
-        });
-
-        // Re-inject the date if Spotify re-renders the widget and wipes it.
-        // The element is considered missing only if it's still missing when the
-        // timer fires. displayReleaseDate() itself removes and re-adds the
-        // element, so without this re-check the observer would reschedule
-        // displayReleaseDate() forever (flicker + endless API requests).
-        const needsReleaseDate = () =>
-            !document.getElementById('nprd-releaseDate') && document.querySelector(storageGet('position'));
-        const domWatcher = new MutationObserver(() => {
-            if (needsReleaseDate()) {
-                clearTimeout(rdDomWatcherTimer);
-                rdDomWatcherTimer = setTimeout(() => {
-                    if (needsReleaseDate()) displayReleaseDate();
-                }, 150);
-            }
-        });
-        domWatcher.observe(document.body, { childList: true, subtree: true });
-
-        hideElementById('nprd-settingsMenu');
-
-        if (window.operatingSystem === "Windows") {
-            await Spicetify.Player.dispatchEvent(new Event('songchange'));
-        } else {
-            try {
-                await displayReleaseDate();
-            } catch (error) {
-                console.error('[NPRD] Error in initial display:', error);
-            }
-        }
-
-        document.head.appendChild(await releaseDateCSS());
-
-        createSettingsMenu();
-    } catch (error) {
-        console.error('[NPRD] Error initializing: ', error, "\nCreate a new issue on the github repo to get this resolved");
-    }
-}
-
-function hideElementById(id) {
-    const element = document.getElementById(id);
-    if (element) {
-        element.style.display = 'none';
-    }
-}
-
-async function displayReleaseDate() {
-    try {
-        const { releaseDate, trackDetails } = await getTrackDetailsRD();
-
-        let formattedReleaseDate;
-
-        switch (storageGet('dateFormat')) {
-            case "DD-MM-YYYY":
-                formattedReleaseDate = `${String(releaseDate.getDate()).padStart(2, '0')}-${String(releaseDate.getMonth() + 1).padStart(2, '0')}-${releaseDate.getFullYear()}`;
-                break;
-            case "MM-DD-YYYY":
-                formattedReleaseDate = `${String(releaseDate.getMonth() + 1).padStart(2, '0')}-${String(releaseDate.getDate()).padStart(2, '0')}-${releaseDate.getFullYear()}`;
-                break;
-            case "YYYY-MM-DD":
-                formattedReleaseDate = `${releaseDate.getFullYear()}-${String(releaseDate.getMonth() + 1).padStart(2, '0')}-${String(releaseDate.getDate()).padStart(2, '0')}`;
-                break;
-            default:
-                formattedReleaseDate = releaseDate;
-        }
-
-        removeExistingReleaseDateElement();
-        const token = ++releaseDateToken;
-
-        setTimeout(() => {
-            if (token !== releaseDateToken) return; // superseded by a newer call
-
-            const releaseDateElement = createReleaseDateElement(storageGet('separator') || '•', formattedReleaseDate);
-            const selector = storageGet('position');
-            console.log('[NPRD] Looking for selector:', selector);
-            const container = selector ? document.querySelector(selector) : null;
-
-            if (container) {
-                container.appendChild(releaseDateElement);
-            } else {
-                console.error('[NPRD] Failed to find container for selector:', selector);
-                const fallbackSelectors = [
-                    '.main-nowPlayingWidget-nowPlaying:not(#upcomingSongDiv) .main-trackInfo-name',
-                    '.main-nowPlayingWidget-nowPlaying:not(#upcomingSongDiv) .main-trackInfo-artists',
-                    '.main-trackInfo-name',
-                    '.main-trackInfo-container [class*="name"]',
-                ];
-
-                for (const fallbackSelector of fallbackSelectors) {
-                    const fallbackContainer = document.querySelector(fallbackSelector);
-                    if (fallbackContainer) {
-                        console.log('[NPRD] Found fallback container:', fallbackSelector);
-                        fallbackContainer.appendChild(releaseDateElement);
-                        return;
-                    }
-                }
-                console.error('[NPRD] All fallback selectors failed');
-            }
-        }, 50);
-    } catch (error) {
-        console.error('[NPRD] Error displaying release date:', error);
-    }
-}
-
-function removeExistingReleaseDateElement() {
-    removeElementById('nprd-releaseDate');
-    hideElementById('nprd-settingsMenu');
-}
-
-function removeElementById(id) {
-    const element = document.getElementById(id);
-    if (element) {
-        element.remove();
-    }
-}
-
-function createReleaseDateElement(separator, formattedReleaseDate) {
+function createReleaseDateElement(separatorText, formattedReleaseDate, album, releaseDate) {
     const releaseDateElement = createDivElement('nprd-releaseDate');
 
-    if (separator && separator.trim() !== "") {
+    const bracketsMap = {
+        "()": ["(", ")"],
+        "[]": ["[", "]"],
+        "{}": ["{", "}"],
+        "<>": ["<", ">"]
+    };
+
+    let displayText = formattedReleaseDate;
+
+    if (bracketsMap[separatorText]) {
+        const [open, close] = bracketsMap[separatorText];
+        displayText = `${open}${formattedReleaseDate}${close}`;
+    } else if (separatorText !== undefined && separatorText !== null && separatorText !== "") {
         const separatorElement = document.createElement("p");
-        separatorElement.textContent = separator;
+        separatorElement.textContent = separatorText;
         releaseDateElement.appendChild(separatorElement);
     }
 
-    const dateElement = createAnchorElement(formattedReleaseDate);
+    const dateElement = createAnchorElement(displayText);
     releaseDateElement.appendChild(dateElement);
 
     const position = storageGet('position');
@@ -430,38 +457,126 @@ function createReleaseDateElement(separator, formattedReleaseDate) {
         setElementStyles(releaseDateElement, targetedStyles);
     }
 
-    if (!document.getElementById('nprd-settingsMenu')) {
-        createSettingsMenu();
-    }
-
-    dateElement.addEventListener('click', function (event) {
+    const handleInteraction = (event) => {
+        if (event.type === 'keydown' && event.key !== 'Enter' && event.key !== ' ') return;
         event.preventDefault();
-        toggleSettingsMenu(dateElement);
-    });
+        event.stopPropagation();
+        toggleSettingsMenu(dateElement, album, releaseDate);
+    };
+
+    dateElement.addEventListener('click', handleInteraction);
+    dateElement.addEventListener('keydown', handleInteraction);
 
     return releaseDateElement;
 }
 
-function createDivElement(id) {
-    const divElement = document.createElement("div");
-    divElement.id = id;
-    return divElement;
+function createNativeDropdown(id, label, options, releaseDate = null) {
+    const dropdownContainer = document.createElement("div");
+    dropdownContainer.classList.add('Dropdown-container');
+
+    const labelElement = document.createElement("label");
+    labelElement.textContent = label;
+    dropdownContainer.appendChild(labelElement);
+
+    const selectElement = document.createElement("select");
+    selectElement.id = 'nprd-' + id;
+    selectElement.classList.add('releaseDateDropdown-control');
+
+    options.forEach(option => {
+        const optionElement = document.createElement("option");
+        optionElement.value = option.value;
+
+        if (id === 'dateFormat' && releaseDate) {
+            const preview = formatReleaseDate(releaseDate, option.value);
+            optionElement.textContent = preview || option.text;
+        } else {
+            optionElement.textContent = option.text;
+        }
+
+        if (storageGet(id) === option.value) {
+            optionElement.selected = true;
+        }
+        selectElement.appendChild(optionElement);
+    });
+
+    selectElement.addEventListener('change', async function () {
+        storageSet(id, selectElement.value);
+        await displayReleaseDate();
+    });
+
+    dropdownContainer.appendChild(selectElement);
+    return dropdownContainer;
 }
 
-function createAnchorElement(textContent) {
-    const anchorElement = document.createElement("a");
-    anchorElement.textContent = textContent;
-    anchorElement.style.cursor = 'pointer';
-    return anchorElement;
+function populateAlbumInfo(container, album) {
+    if (!album) return;
+    container.innerHTML = '';
+
+    const albumLinkElement = document.createElement('a');
+    albumLinkElement.href = album.external_urls?.spotify || '#';
+    albumLinkElement.target = '_blank';
+
+    let albumImage;
+    if (album.images && album.images.length > 0) {
+        const smallImage = album.images.find(img => img.size === 'SMALL') || album.images[0];
+        if (smallImage?.url) {
+            albumImage = document.createElement('img');
+            albumImage.src = smallImage.url;
+            albumImage.width = 40;
+            albumImage.height = 40;
+            albumImage.style.marginRight = '0.75rem';
+            albumImage.style.borderRadius = '4px';
+            albumImage.style.objectFit = 'cover';
+        }
+    }
+
+    const artistName = Array.isArray(album.artists)
+        ? album.artists.map(a => a.name || 'Unknown').join(', ')
+        : (album.artists?.name || 'Unknown Artist');
+
+    const albumNameElement = document.createElement('p');
+    albumNameElement.textContent = `${album.name || 'Unknown Album'} - ${artistName}`;
+    albumNameElement.style.margin = '0';
+    albumNameElement.style.fontWeight = 'bold';
+    albumNameElement.style.fontSize = '0.85rem';
+
+    const albumTypeElement = document.createElement('p');
+    albumTypeElement.textContent = album.album_type || 'album';
+    albumTypeElement.style.cssText = "text-transform: capitalize; margin: 0; opacity: 0.7; font-size: 0.75rem;";
+
+    const textContainer = document.createElement('div');
+    textContainer.style.overflow = 'hidden';
+    textContainer.appendChild(albumNameElement);
+    textContainer.appendChild(albumTypeElement);
+
+    if (albumImage) {
+        albumLinkElement.appendChild(albumImage);
+    }
+    albumLinkElement.appendChild(textContainer);
+
+    container.appendChild(albumLinkElement);
 }
 
-function setElementStyles(element, styles) {
-    element.style.fontSize = styles.fontSize;
-    element.style.fontWeight = styles.fontWeight;
-    element.style.minWidth = "75px";
+function updateSettingsMenuInfo(album, releaseDate) {
+    const albumContainer = document.getElementById('nprd-albumInfoContainer');
+    if (albumContainer && album) {
+        populateAlbumInfo(albumContainer, album);
+    }
+    if (releaseDate) {
+        const dateFormatSelect = document.getElementById('nprd-dateFormat');
+        if (dateFormatSelect) {
+            dateformat.forEach((option, index) => {
+                const optEl = dateFormatSelect.options[index];
+                if (optEl) {
+                    const preview = formatReleaseDate(releaseDate, option.value);
+                    optEl.textContent = preview || option.text;
+                }
+            });
+        }
+    }
 }
 
-function createSettingsMenu() {
+function createSettingsMenu(album, releaseDate) {
     const existingSettingsMenu = document.getElementById('nprd-settingsMenu');
     if (existingSettingsMenu) {
         existingSettingsMenu.remove();
@@ -479,127 +594,197 @@ function createSettingsMenu() {
     const positionDropdown = createNativeDropdown("position", "Position", positions);
     optionsDiv.appendChild(positionDropdown);
 
-    const dateFormatDropdown = createNativeDropdown("dateFormat", "Date Format", dateformat);
+    const dateFormatDropdown = createNativeDropdown("dateFormat", "Date Order", dateformat, releaseDate);
     optionsDiv.appendChild(dateFormatDropdown);
 
-    const separatorDropdown = createNativeDropdown("separator", "Separator style", separator);
+    const dateSepDropdown = createNativeDropdown("dateSeparator", "Date Separator", dateseparator);
+    optionsDiv.appendChild(dateSepDropdown);
+
+    const separatorDropdown = createNativeDropdown("separator", "Widget Separator", separator);
     optionsDiv.appendChild(separatorDropdown);
 
     settingsMenu.appendChild(optionsDiv);
 
-    getTrackDetailsRD().then(({ album }) => {
-        const albumLinkElement = document.createElement('a');
-        albumLinkElement.href = album.external_urls.spotify;
+    const albumInfoContainer = createDivElement('nprd-albumInfoContainer');
+    settingsMenu.appendChild(albumInfoContainer);
 
-        let albumImage;
-        if (album.images && album.images.length > 0) {
-            const smallImage = album.images.find(img => img.size === 'SMALL') || album.images[0];
-            if (smallImage) {
-                albumImage = document.createElement('img');
-                albumImage.src = smallImage.url;
-                albumImage.width = 50;
-                albumImage.height = 50;
-                albumImage.style.marginRight = '1rem';
-                albumImage.style.borderRadius = '4px';
-                albumImage.style.objectFit = 'cover';
-            }
-        }
-
-        const albumNameElement = document.createElement('p');
-        albumNameElement.textContent = `${album.name} - ${Array.isArray(album.artists) ? album.artists[0].name : (album.artists?.name || 'Unknown Artist')} \n`;
-
-        const albumTypeElement = document.createElement('p');
-        albumTypeElement.textContent = album.album_type;
-        albumTypeElement.style.cssText = "text-transform: capitalize;";
-
-        const albumContainer = document.createElement('div');
-
-        albumContainer.appendChild(albumNameElement);
-        albumContainer.appendChild(albumTypeElement);
-
-        if (albumImage) {
-            albumLinkElement.appendChild(albumImage);
-        }
-        albumLinkElement.appendChild(albumContainer);
-
-        settingsMenu.appendChild(albumLinkElement);
-    }).catch(error => {
-        console.error('[NPRD] Error loading album in settings menu:', error);
-        const fallbackElement = document.createElement('p');
-        fallbackElement.textContent = 'Album information unavailable';
-        fallbackElement.style.color = 'var(--spice-subtext)';
-        settingsMenu.appendChild(fallbackElement);
-    });
+    if (album) {
+        populateAlbumInfo(albumInfoContainer, album);
+    } else {
+        getTrackDetailsRD().then(({ album: fetchedAlbum, releaseDate: fetchedDate }) => {
+            populateAlbumInfo(albumInfoContainer, fetchedAlbum);
+            updateSettingsMenuInfo(fetchedAlbum, fetchedDate);
+        }).catch(error => {
+            console.error('[NPRD] Error loading album in settings menu:', error);
+            albumInfoContainer.textContent = 'Album information unavailable';
+            albumInfoContainer.style.color = 'var(--spice-subtext)';
+        });
+    }
 
     document.body.appendChild(settingsMenu);
+    return settingsMenu;
 }
 
-function createNativeDropdown(id, label, options) {
-    const dropdownContainer = document.createElement("div");
-    dropdownContainer.classList.add('Dropdown-container');
-
-    const labelElement = document.createElement("label");
-    labelElement.textContent = label;
-    dropdownContainer.appendChild(labelElement);
-
-    const selectElement = document.createElement("select");
-    selectElement.id = 'nprd-' + id;
-    selectElement.classList.add('releaseDateDropdown-control');
-
-    options.forEach(option => {
-        const optionElement = document.createElement("option");
-        optionElement.value = option.value;
-        optionElement.textContent = option.text;
-        if (storageGet(id) === option.value) {
-            optionElement.selected = true;
-        }
-        selectElement.appendChild(optionElement);
-    });
-
-    selectElement.addEventListener('change', async function () {
-        storageSet(id, selectElement.value);
-        await displayReleaseDate();
-    });
-
-    dropdownContainer.appendChild(selectElement);
-
-    return dropdownContainer;
-}
-
-function toggleSettingsMenu(dateElement) {
-    const settingsMenu = document.getElementById('nprd-settingsMenu');
-    if (!settingsMenu) return;
-
-    const rect = dateElement.getBoundingClientRect();
-
-    settingsMenu.style.position = 'absolute';
-    settingsMenu.style.left = `${rect.left}px`;
-    settingsMenu.style.bottom = `${window.innerHeight - rect.top}px`;
-
-    if (settingsMenu.style.display === '') {
-        settingsMenu.style.display = 'flex';
+function toggleSettingsMenu(dateElement, album, releaseDate) {
+    let settingsMenu = document.getElementById('nprd-settingsMenu');
+    if (!settingsMenu) {
+        settingsMenu = createSettingsMenu(album, releaseDate);
     } else {
-        settingsMenu.style.display = settingsMenu.style.display === 'none' ? 'flex' : 'none';
+        updateSettingsMenuInfo(album, releaseDate);
     }
 
-    document.removeEventListener('click', closeSettingsMenu);
+    const isVisible = settingsMenu.style.display === 'flex';
 
-    document.addEventListener('click', closeSettingsMenu);
+    if (isVisible) {
+        settingsMenu.style.display = 'none';
+    } else {
+        const rect = dateElement.getBoundingClientRect();
+        const left = Math.max(10, Math.min(rect.left, window.innerWidth - 300));
+        const bottom = Math.max(10, window.innerHeight - rect.top + 8);
 
-    function closeSettingsMenu(event) {
-        if (!settingsMenu.contains(event.target) && event.target !== dateElement) {
-            settingsMenu.style.display = 'none';
+        settingsMenu.style.position = 'fixed';
+        settingsMenu.style.left = `${left}px`;
+        settingsMenu.style.bottom = `${bottom}px`;
+        settingsMenu.style.top = 'auto';
+        settingsMenu.style.zIndex = '10001';
+        settingsMenu.style.display = 'flex';
+
+        const closeSettingsMenu = (event) => {
+            if (event.type === 'keydown' && event.key === 'Escape') {
+                settingsMenu.style.display = 'none';
+                cleanupListeners();
+            } else if (event.type === 'click' && !settingsMenu.contains(event.target) && !dateElement.contains(event.target)) {
+                settingsMenu.style.display = 'none';
+                cleanupListeners();
+            }
+        };
+
+        const cleanupListeners = () => {
             document.removeEventListener('click', closeSettingsMenu);
-        }
+            document.removeEventListener('keydown', closeSettingsMenu);
+        };
+
+        setTimeout(() => {
+            document.addEventListener('click', closeSettingsMenu);
+            document.addEventListener('keydown', closeSettingsMenu);
+        }, 10);
     }
 }
 
-function refreshSettingsMenu() {
-    const settingsMenu = document.getElementById('nprd-settingsMenu');
-    if (settingsMenu) {
-        settingsMenu.remove();
-    }
-    createSettingsMenu();
+let releaseDateToken = 0;
+let rdDomWatcherTimer;
+let isDisplaying = false;
+
+function removeExistingReleaseDateElement() {
+    removeElementById('nprd-releaseDate');
+    hideElementById('nprd-settingsMenu');
 }
+
+async function displayReleaseDate() {
+    if (isDisplaying) return;
+    isDisplaying = true;
+    const token = ++releaseDateToken;
+
+    try {
+        const { releaseDate, album } = await getTrackDetailsRD();
+        if (token !== releaseDateToken) return;
+
+        removeExistingReleaseDateElement();
+
+        const formattedReleaseDate = formatReleaseDate(releaseDate, storageGet('dateFormat'), storageGet('dateSeparator'));
+        if (!formattedReleaseDate) {
+            console.warn('[NPRD] No valid release date to display');
+            return;
+        }
+
+        const releaseDateElement = createReleaseDateElement(storageGet('separator') ?? '•', formattedReleaseDate, album, releaseDate);
+        const selector = storageGet('position');
+        const container = selector ? document.querySelector(selector) : null;
+
+        if (container) {
+            container.appendChild(releaseDateElement);
+        } else {
+            console.warn('[NPRD] Failed to find container for selector:', selector);
+            const fallbackSelectors = [
+                '.main-nowPlayingWidget-nowPlaying .main-trackInfo-name',
+                '.main-nowPlayingWidget-nowPlaying .main-trackInfo-artists',
+                '.main-trackInfo-name',
+                '.main-trackInfo-container [class*="name"]',
+            ];
+
+            for (const fallbackSelector of fallbackSelectors) {
+                const fallbackContainer = document.querySelector(fallbackSelector);
+                if (fallbackContainer) {
+                    fallbackContainer.appendChild(releaseDateElement);
+                    break;
+                }
+            }
+        }
+    } catch (error) {
+        console.error('[NPRD] Error displaying release date:', error);
+    } finally {
+        isDisplaying = false;
+    }
+}
+
+async function initializeRD() {
+    try {
+        await waitForSpicetify();
+
+        let debounceTimer;
+
+        Spicetify.Player.addEventListener("songchange", () => {
+            removeExistingReleaseDateElement();
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(async () => {
+                try {
+                    await displayReleaseDate();
+                } catch (error) {
+                    console.error('[NPRD] Error in songchange handler:', error);
+                }
+            }, 50);
+        });
+
+        const needsReleaseDate = () => {
+            if (document.getElementById('nprd-releaseDate')) return false;
+            const primary = storageGet('position');
+            if (primary && document.querySelector(primary)) return true;
+            const fallbacks = [
+                '.main-nowPlayingWidget-nowPlaying .main-trackInfo-name',
+                '.main-nowPlayingWidget-nowPlaying .main-trackInfo-artists',
+                '.main-trackInfo-name',
+                '.main-trackInfo-container [class*="name"]',
+            ];
+            return fallbacks.some(sel => document.querySelector(sel));
+        };
+        const domWatcher = new MutationObserver(() => {
+            if (needsReleaseDate() && !isDisplaying) {
+                clearTimeout(rdDomWatcherTimer);
+                rdDomWatcherTimer = setTimeout(() => {
+                    if (needsReleaseDate() && !isDisplaying) displayReleaseDate();
+                }, 200);
+            }
+        });
+
+        const targetContainer = document.querySelector('.main-nowPlayingWidget-nowPlaying') ||
+                                document.querySelector('.main-nowPlayingBar-left') ||
+                                document.body;
+        domWatcher.observe(targetContainer, { childList: true, subtree: true });
+
+        hideElementById('nprd-settingsMenu');
+
+        if (!document.getElementById('nprd')) {
+            document.head.appendChild(await releaseDateCSS());
+        }
+
+        await displayReleaseDate();
+    } catch (error) {
+        console.error('[NPRD] Error initializing:', error);
+    }
+}
+
+(async function () {
+    await initializeRD();
+})();
 
 })();
